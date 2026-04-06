@@ -1,6 +1,13 @@
-import configparser, subprocess, threading, itertools, argparse, platform, logging, datetime, fnmatch, shutil, pandas as pd, shlex, html, copy, time, json, math, csv, os, re
+import configparser, subprocess, threading, itertools, argparse, platform, logging, datetime, fnmatch, shutil, pandas as pd, shlex, html, copy, time, json, math, csv, os, re, sys
+from multiprocessing import Pool, cpu_count
 from colorama import init, deinit, reinit, Fore, Back, Style
-from gfmhelper import GoProFrameMakerHelper
+from gfmhelper import GoProFrameMakerHelper, SharpnessAnalyzer
+from sensor_processing import parse_gpmf_gyro, integrate_gyro_roll
+from frame_rendering import _process_fisheye_frame, _process_360_frame, _process_360_frame_wrapper
+from exif_utils import ExiftoolGetMetadata, ExiftoolGetImagesMetadata, ExiftoolInjectMetadata, ExiftoolInjectImagesMetadata
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'max2sphere'))
+import max2sphere as _max2sphere      # For 360° equirectangular images
+import max2fisheye as _max2fisheye    # For fisheye images
 from geographiclib.geodesic import Geodesic
 from decimal import Decimal, getcontext
 from haversine import haversine, Unit
@@ -11,131 +18,48 @@ import itertools
 import gpxpy
 
 
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-def ExiftoolGetMetadata(path, image, imageData):
-    #Get metadata from exiftool
-    cmd = ["exiftool", "-ee", "-G3", "-j", "{}{}{}".format(path, os.sep, image)]
-    output = subprocess.run(cmd, capture_output=True)
-    output = output.stdout.decode('utf-8',"ignore")
-    photo = json.loads(output)[0]
-    imageData[image] = photo
-    #print(photo)
-
-def ExiftoolGetImagesMetadata(path, images, imageData):
-    images = list(chunks(images, 5))
-
-    for image in images:
-        threads = []
-        for i in range(0, len(image)):
-            threads.append(threading.Thread(target=ExiftoolGetMetadata, args=(path, image[i],imageData,)))
-
-        for t in threads:
-            t.start()
-
-        for t in threads:
-            t.join()
-    return imageData
-
-def ExiftoolInjectMetadata(metadata):
-    metadata.insert(0, "exiftool")
-    output = subprocess.run(metadata, capture_output=True)
-    if output.returncode == 0:
-        print("Injecting additional metadata to {} is done.".format(metadata[-1]))
-    else:
-        print("Error Injecting additional metadata to {}.".format(metadata[-1]))
-
-def ExiftoolInjectImagesMetadata(cmdMetaDataAll):
-    metadatas = list(chunks(cmdMetaDataAll, 5))
-
-    for metadata in metadatas:
-        threads = []
-        for i in range(0, len(metadata)):
-            threads.append(threading.Thread(target=ExiftoolInjectMetadata, args=(metadata[i],)))
-
-        for t in threads:
-            t.start()
-
-        for t in threads:
-            t.join()
-    return
-
-def createNadir(nadir, magick):
-    print(nadir, magick)
-    #magick trek-view-square-nadir.png -rotate 180 -strip trek-view-square-nadir-1.png
-    #magick trek-view-square-nadir-1.png -distort DePolar 0  trek-view-square-nadir-2.png
-    #magick trek-view-square-nadir-2.png -flip  trek-view-square-nadir-3.png
-    #magick trek-view-square-nadir-3.png -flop  trek-view-square-nadir-4.png
-    cmd = [
-        magick, nadir, "-rotate", "180", "-strip", nadir
-    ]
-    out = subprocess.run(cmd)
-    print(out)
-    cmd = [
-        magick, nadir, "-distort", "DePolar", "0", "-strip", nadir
-    ]
-    out = subprocess.run(cmd)
-    print(out)
-    cmd = [
-        magick, nadir, "-flip", "-strip", nadir
-    ]
-    out = subprocess.run(cmd)
-    print(out)
-    cmd = [
-        magick, nadir, "-flop", "-strip", nadir
-    ]
-    out = subprocess.run(cmd)
-    print(out)
-    return nadir
-
-def AddNadir(image, nadir, magick, imageData, equirectangular, height_percentage=15):
-    image_path = Path(image)
-    nadir_path = Path(nadir)
-
-    new_nadir_path = Path(str(image_path.parent)+os.sep+str(nadir_path.name))
-    new_nadir_path.write_bytes(nadir_path.read_bytes())
-
-    image = str(image_path.resolve())
-    nadir = str(new_nadir_path.resolve())
-    print('equirectangular', equirectangular)
-    imageWidth = imageData["Main:ImageWidth"]
-    imageHeight = imageData["Main:ImageHeight"]
-    if equirectangular == False:
-        imageWidth = "-1"
-    else:
-        nadir = createNadir(nadir, magick)
-        imageWidth = str(imageWidth)
-    imageHeight = int(imageHeight)*(height_percentage/100)
-    imageHeight = str(round(imageHeight))
-    print(imageWidth, imageHeight)
-    print("path for nadir: {}".format(nadir))
-    print("path for image: {}".format(image))
-    cmd = [
-        "ffmpeg", 
-        "-y", 
-        "-i", 
-        str("{}".format(image)), 
-        "-i", str("{}".format(nadir)), 
-        "-filter_complex", str("[1:v]scale="+imageWidth+":"+imageHeight+" [ovrl],[0:v][ovrl] overlay=(W-w):(H-h)"), 
-        str("{}".format(image))
-    ]
-    print(" ".join(cmd))
-    logging.info(" ".join(cmd))
-    fout = subprocess.run(cmd)
-    logging.info("Adding Nadir to {} is done.".format(image))
-    print("Adding Nadir to {} is done.".format(image))
-
-
 class GoProFrameMakerParent():
     def __init__(self, args):
         getcontext().prec = 6
         media_folder_full_path = str(args["media_folder_full_path"].resolve())
         try:
             if os.path.exists(media_folder_full_path):
-                shutil.rmtree(media_folder_full_path)
-            os.makedirs(media_folder_full_path, exist_ok=True) 
+                # If an existing frame_mapping exists and sharpness mode requested, preserve everything
+                frame_mapping_path = os.path.join(media_folder_full_path, 'frame_mapping.json')
+                if args.get('detect_sharpness', False) and os.path.exists(frame_mapping_path):
+                    print(f"Found existing frame_mapping.json - preserving folder contents and reusing sharpness mapping")
+                    logging.info("Preserving existing frame_mapping.json and folder contents")
+                else:
+                    # Check if track0 and track5 exist with images - preserve them if they do
+                    track0_path = os.path.join(media_folder_full_path, 'track0')
+                    track5_path = os.path.join(media_folder_full_path, 'track5')
+                    preserve_tracks = (os.path.exists(track0_path) and 
+                                      len(fnmatch.filter(os.listdir(track0_path), '*.jpg')) > 0 and
+                                      os.path.exists(track5_path) and 
+                                      len(fnmatch.filter(os.listdir(track5_path), '*.jpg')) > 0)
+                    
+                    if preserve_tracks:
+                        # Only delete non-track folders and files, keep track0 and track5
+                        print(f"Found existing track0 and track5 with images - preserving them and skipping ffmpeg extraction")
+                        logging.info("Preserving existing track0 and track5 folders")
+                        for item in os.listdir(media_folder_full_path):
+                            item_path = os.path.join(media_folder_full_path, item)
+                            if item not in ['track0', 'track5']:
+                                if os.path.isdir(item_path):
+                                    shutil.rmtree(item_path)
+                                else:
+                                    os.remove(item_path)
+                    else:
+                        # No tracks to preserve, clear all contents but keep base folder
+                        for item in os.listdir(media_folder_full_path):
+                            item_path = os.path.join(media_folder_full_path, item)
+                            if os.path.isdir(item_path):
+                                shutil.rmtree(item_path)
+                            else:
+                                os.remove(item_path)
+                            os.remove(item_path)
+            else:
+                os.makedirs(media_folder_full_path, exist_ok=True) 
         except:
             exit('Unable to create main media directory {}'.format(media_folder_full_path))
         
@@ -349,8 +273,11 @@ class GoProFrameMakerParent():
     def _ffmpeg(self, command, sh=0):
         ffmpeg = str(self.__args['ffmpeg'].resolve())
         command.insert(0, ffmpeg)
-        ret = self.__subprocess(command, sh, False)
-        print(ret)
+        # Add quiet flags to suppress ffmpeg output
+        if '-v' not in command and '-loglevel' not in command:
+            command.insert(1, '-v')
+            command.insert(2, 'error')
+        ret = self.__subprocess(command, sh, True)
         
         """if ret["error"] is not None:
             logging.critical(ret["error"])
@@ -388,7 +315,203 @@ class GoProFrameMaker(GoProFrameMakerParent):
         return copy.deepcopy(self.get_arguments())
 
     def initiateProcessing(self):
-        self.__startProcessing()
+        args = self.getArguments()
+        if args.get('folder_mode', False):
+            # Folder mode: skip video processing, go directly to fisheye/360 generation
+            self.__processFolderMode()
+        else:
+            # Normal mode: process video file
+            self.__startProcessing()
+
+    def __processFolderMode(self):
+        """Process existing track0/track5 folders without a video file."""
+        args = self.getArguments()
+        media_folder_full_path = str(args["input"][0].resolve())
+        
+        logging.info("Folder mode: Processing existing frames from {}".format(media_folder_full_path))
+        print("Folder mode: Processing existing frames from {}".format(media_folder_full_path))
+        
+        # Update media_folder_full_path in args
+        args["media_folder_full_path"] = Path(media_folder_full_path)
+        
+        # Go directly to fisheye/360 generation (reuse the logic from __breakIntoFrames360)
+        # This will automatically detect existing track0/track5 and skip ffmpeg
+        track0 = os.path.join(media_folder_full_path, 'track0')
+        track5 = os.path.join(media_folder_full_path, 'track5')
+        
+        total_images = fnmatch.filter(os.listdir(track0), '*.jpg')
+        total_images.sort()
+
+        # Build frame_numbers respecting max_seconds
+        all_frame_numbers = [int(os.path.splitext(f)[0]) for f in total_images]
+        max_seconds = args.get('max_seconds')
+        if max_seconds is not None:
+            # Without video, we estimate FPS from frame count
+            # Default to 30fps for estimation if not specified
+            est_fps = args.get('frame_rate', 30.0)
+            max_frame_count = max(1, int(max_seconds * est_fps))
+            frame_numbers = all_frame_numbers[:max_frame_count]
+        else:
+            frame_numbers = all_frame_numbers
+        max_frames = len(frame_numbers)
+
+        # For folder mode, we can't get video duration, so estimate based on frame count
+        duration = max_frames / args.get('frame_rate', 30.0)
+
+        try:
+            # Determine template and output size from the first frame pair
+            which_template, fw, fh = _max2fisheye.check_frames(
+                os.path.join(track0, total_images[0]),
+                os.path.join(track5, total_images[0]),
+            )
+            
+            # Determine which modes to run
+            fisheye_only = args.get('fisheye_only', False)
+            e360_only = args.get('e360_only', False)
+            run_fisheye = not e360_only
+            run_360 = not fisheye_only
+            
+            antialias = int(args.get('antialias', 2))
+            seq_tmpl = os.path.join(media_folder_full_path, 'track%d', '%06d.jpg')
+            
+            # FISHEYE IMAGE GENERATION
+            if run_fisheye:
+                if args.get('fisheye_width') is not None:
+                    out_size = (args['fisheye_width'] // 4) * 4
+                else:
+                    out_size = 2800
+                
+                lut_file = args.get('lut_file')
+                if lut_file and os.path.isfile(lut_file):
+                    logging.info("Loading fisheye lookup table from: {}".format(lut_file))
+                    print("Loading fisheye lookup table from: {}".format(lut_file))
+                    import numpy as _np
+                    _d = _np.load(lut_file)
+                    face_lut, u_lut, v_lut = _d['face'], _d['u'], _d['v']
+                else:
+                    if lut_file:
+                        print("Warning: --lut-file '{}' not found, generating LUT instead.".format(lut_file))
+                    logging.info("Building fisheye lookup table (out_size={}, aa={})...".format(out_size, antialias))
+                    print("Building fisheye lookup table (out_size={}, aa={})...".format(out_size, antialias))
+                    face_lut, u_lut, v_lut = _max2fisheye.build_lookup_table(
+                        out_size, antialias, which_template,
+                    )
+
+                out_tmpl = os.path.join(media_folder_full_path, 'lens%d_%06d.jpg')
+
+                logging.info("Rendering fisheye frames...")
+                num_cores = max(1, cpu_count() - 1)
+
+                process_args = []
+                for nframe in frame_numbers:
+                    process_args.append((
+                        nframe, seq_tmpl, face_lut, u_lut, v_lut, out_size, antialias,
+                        which_template, out_tmpl, bool(args.get('debug', False)),
+                        None  # No gyro data in folder mode
+                    ))
+                
+                total_frames = len(frame_numbers)
+                completed = 0
+                failed_frames = []
+                
+                with Pool(processes=num_cores) as pool:
+                    for result in pool.starmap(_process_fisheye_frame, process_args):
+                        nframe, success = result
+                        if not success:
+                            failed_frames.append(nframe)
+                        completed += 1
+                        filled = int(45 * completed / total_frames)
+                        bar = '█' * filled + '░' * (45 - filled)
+                        pct = completed / total_frames * 100
+                        print(f'\r  Fisheye   |{bar}| {completed}/{total_frames} ({pct:.1f}%)', end='', flush=True)
+                
+                print()
+                
+                if failed_frames:
+                    logging.warning(f"Failed to process {len(failed_frames)} frames: {failed_frames[:10]}")
+                    print(f"Warning: {len(failed_frames)} frames failed to process")
+
+                # Move fisheye images to subfolders
+                front_folder = os.path.join(media_folder_full_path, 'front')
+                back_folder = os.path.join(media_folder_full_path, 'back')
+                os.makedirs(front_folder, exist_ok=True)
+                os.makedirs(back_folder, exist_ok=True)
+                for nframe in frame_numbers:
+                    src_front = os.path.join(media_folder_full_path, 'lens0_{:06d}.jpg'.format(nframe))
+                    dst_front = os.path.join(front_folder, 'front_{:06d}.jpg'.format(nframe))
+                    if os.path.exists(src_front):
+                        os.rename(src_front, dst_front)
+                    src_back = os.path.join(media_folder_full_path, 'lens1_{:06d}.jpg'.format(nframe))
+                    dst_back = os.path.join(back_folder, 'back_{:06d}.jpg'.format(nframe))
+                    if os.path.exists(src_back):
+                        os.rename(src_back, dst_back)
+            
+            # 360° EQUIRECTANGULAR IMAGE GENERATION
+            if run_360:
+                out_width_360 = 4096
+                out_height_360 = 2048
+                
+                logging.info("Building 360° equirectangular lookup table ({}×{}, aa={})...".format(
+                    out_width_360, out_height_360, antialias))
+                print("Building 360° equirectangular lookup table ({}×{}, aa={})...".format(
+                    out_width_360, out_height_360, antialias))
+                
+                face_lut_360, u_lut_360, v_lut_360 = _max2sphere.build_lookup_table(
+                    out_width_360, out_height_360, antialias, which_template,
+                )
+                
+                out_tmpl_360 = os.path.join(media_folder_full_path, 'sphere_%06d.jpg')
+                
+                logging.info("Rendering 360° equirectangular frames...")
+                num_cores = max(1, cpu_count() - 1)
+                
+                process_args_360 = []
+                for nframe in frame_numbers:
+                    process_args_360.append((
+                        nframe, seq_tmpl, face_lut_360, u_lut_360, v_lut_360,
+                        out_width_360, out_height_360, antialias,
+                        which_template, out_tmpl_360, bool(args.get('debug', False))
+                    ))
+                
+                total_frames = len(frame_numbers)
+                completed = 0
+                failed_frames_360 = []
+                
+                with Pool(processes=num_cores) as pool:
+                    for result in pool.starmap(_process_360_frame, process_args_360):
+                        nframe, success = result
+                        if not success:
+                            failed_frames_360.append(nframe)
+                        completed += 1
+                        filled = int(45 * completed / total_frames)
+                        bar = '█' * filled + '░' * (45 - filled)
+                        pct = completed / total_frames * 100
+                        print(f'\r  360°      |{bar}| {completed}/{total_frames} ({pct:.1f}%)', end='', flush=True)
+                
+                print()
+                
+                if failed_frames_360:
+                    logging.warning(f"Failed to process {len(failed_frames_360)} 360° frames: {failed_frames_360[:10]}")
+                    print(f"Warning: {len(failed_frames_360)} 360° frames failed to process")
+                
+                # Move 360 images to subfolder
+                e360_folder = os.path.join(media_folder_full_path, '360')
+                os.makedirs(e360_folder, exist_ok=True)
+                for nframe in frame_numbers:
+                    src_360 = os.path.join(media_folder_full_path, 'sphere_{:06d}.jpg'.format(nframe))
+                    dst_360 = os.path.join(e360_folder, '{:06d}.jpg'.format(nframe))
+                    if os.path.exists(src_360):
+                        os.rename(src_360, dst_360)
+
+        except Exception as e:
+            logging.error(str(e))
+            print(str(e))
+            import traceback
+            traceback.print_exc()
+            exit("Unable to process frames in folder mode.")
+
+        logging.info("Folder mode processing complete.")
+        print("Folder mode processing complete.")
 
     def __startProcessing(self):
         camera = ''
@@ -399,9 +522,7 @@ class GoProFrameMaker(GoProFrameMakerParent):
         if(len(args["input"]) == 1):
             video_file = str(args["input"][0].resolve())
             fileStat = os.stat(video_file)
-            if fileStat.st_size > 8000000000:
-                logging.critical("The following file {} is too large. The maximum size for a single video is 8GB".format(video_file))
-                exit("The following file {} is too large. The maximum size for a single video is 8GB".format(video_file))
+
         #validation fusion video file size
         elif(len(args["input"]) == 2):
             video_file_front = str(args["input"][0].resolve())
@@ -445,82 +566,27 @@ class GoProFrameMaker(GoProFrameMakerParent):
             if camera == 'max':
                 self.__breakIntoFrames(video_file, media_folder_full_path)
             elif camera == 'fusion':
-                fusion_front = "{}{}{}".format(media_folder_full_path, os.sep, 'front')
-                if os.path.exists(fusion_front):
-                    shutil.rmtree(fusion_front)
-                os.makedirs(fusion_front, exist_ok=True) 
-                fusion_back = "{}{}{}".format(media_folder_full_path, os.sep, 'back')
-                if os.path.exists(fusion_back):
-                    shutil.rmtree(fusion_back)
-                os.makedirs(fusion_back, exist_ok=True) 
-                self.__breakIntoFrames(video_file_front, fusion_front, '')
-                self.__breakIntoFrames(video_file_back, fusion_back, '')
-                total_images = fnmatch.filter(os.listdir(fusion_front), '*.jpg')
-                cmd = [
-                    str(args['fusion_sphere'].resolve()), 
-                    '-w', str(4096), '-b', '5',
-                    '-g', '1', '-h', str(len(total_images)), 
-                    '-o', "{}{}%06d.jpg".format(media_folder_full_path, os.sep),
-                    '-x', "{}{}%06d.jpg".format(fusion_front, os.sep), "{}{}%06d.jpg".format(fusion_back, os.sep),
-                    str(args['fusion_sphere_params'].resolve())
-                ]
-                output = subprocess.run(cmd, capture_output=True)
-                if os.path.exists(fusion_front):
-                    shutil.rmtree(fusion_front)
-                if os.path.exists(fusion_back):
-                    shutil.rmtree(fusion_back)
+                # Create track0 (front) and track5 (back) folders like Max structure
+                track0 = os.path.join(media_folder_full_path, 'track0')
+                track5 = os.path.join(media_folder_full_path, 'track5')
+                os.makedirs(track0, exist_ok=True)
+                os.makedirs(track5, exist_ok=True)
+                
+                # Extract frames from both videos with sharpness detection support
+                logging.info("Processing Fusion front fisheye frames...")
+                self.__breakIntoFrames(video_file_front, track0, '')
+                
+                logging.info("Processing Fusion back fisheye frames...")
+                self.__breakIntoFrames(video_file_back, track5, '')
+                
+                # Note: Fusion fisheye frames are now in track0/ and track5/ folders
+                # For 360° stitching, would need additional processing similar to max2sphere
+                logging.info("Fusion fisheye frames extracted to track0/ and track5/")
             else:
                 exit('Unknown camera type.')
         else:
             exit('Unknown file type.')
-
-        #ms calculation
-        if args["time_warp"] is None:
-            ms = float(((100.0/float(args["frame_rate"]))/100.0))
-        else:
-            tw = args["time_warp"]
-            fr = args["frame_rate"]
-            tw = int(tw.replace('x', ''))
-            if fr < 1:
-                fr = 5
-            tw = float(tw)/float(fr)
-            ms = float(tw)
-
-        metadata['images'] = fnmatch.filter(os.listdir(media_folder_full_path), '*.jpg')
-        metadata['images'].sort()
-        startTime = metadata['startTime']
-        icounter = 0
-        if len(metadata['images']) > 0:
-            print('\nStarting to geotag all the images...\n')
-            for img in metadata['images']:
-                GPSDateTime = datetime.datetime.strftime(startTime, "%Y:%m:%d %H:%M:%S.%f")
-                tt = GPSDateTime.split(".")
-                tt[1] = tt[1][:3]
-                tz = "T".join(tt[0].split(" "))
-                tt[0] = tz
-                cmdMetaData = [
-                    '-DateTimeOriginal={0}Z'.format(tt[0]),
-                    '-SubSecTimeOriginal={0}'.format(tt[1]),
-                    '-SubSecDateTimeOriginal={0}Z'.format(".".join(tt))
-                ]
-                cmdMetaData.append('-overwrite_original')
-                cmdMetaData.append("{}{}{}".format(media_folder_full_path, os.sep, metadata['images'][icounter]))
-                output = self.exiftool(cmdMetaData)
-                startTime = startTime+datetime.timedelta(0, ms) 
-                icounter = icounter + 1
-            cmd = [
-                '-geotag', 
-                '{}{}{}{}'.format(media_folder_full_path, os.sep, args["media_folder"], "_video.gpx"), 
-                '-geotime<${subsecdatetimeoriginal}', 
-                '-overwrite_original', 
-                media_folder_full_path
-            ]
-            
-            output = self.exiftool(cmd)
-            
-            self.__updateImagesMetadata(metadata, equirectangular)
-        else:
-            exit('Not enough images available for geotagging.')
+        # Geotagging is handled externally by geotag_images.py
 
     def __validateVideo(self, videoData):
         args = self.getArguments()
@@ -543,13 +609,9 @@ class GoProFrameMaker(GoProFrameMakerParent):
             logging.critical("This file does not look like it was captured using a GoPro camera. Only content taken using a GoPro 360 Camera are currently supported.")
             exit("This file does not look like it was captured using a GoPro camera. Only content taken using a GoPro 360 Camera are currently supported.")
         
-        if args["frame_rate"] > 5:
-            logging.warning("It appears the frame rate of this video is very low. You can continue, but the images in the Sequence might not render as expected.")
-            print("It appears the frame rate of this video is very low. You can continue, but the images in the Sequence might not render as expected.")
-
-        if args["time_warp"] is not None:
-            logging.warning("It appears this video was captured in timewarp mode. You can continue, but the images in the Sequence might not render as expected.")
-            print("It appears this video was captured in timewarp mode. You can continue, but the images in the Sequence might not render as expected.")
+        if args["frame_rate"] > 24:
+            logging.warning("High frame rate extraction (>{} fps) will generate many frames and may take significant time and disk space.".format(args["frame_rate"]))
+            print("High frame rate extraction (>{} fps) will generate many frames and may take significant time and disk space.".format(args["frame_rate"]))
 
         FileType = ["MP4", "360", "MOV"]
         if videoData["FileType"].strip().upper() not in FileType:
@@ -575,12 +637,145 @@ class GoProFrameMaker(GoProFrameMakerParent):
                 args["quality"], 
                 args["frame_rate"], tw
             )
+        
+        # Check if sharpness detection is enabled
+        detect_sharpness = args.get('detect_sharpness', False)
+        crop_size = args.get('crop_size', 256)
+        threshold = args.get('threshold', None)
+        media_folder_full_path = str(args["media_folder_full_path"].resolve())
+        frame_mapping_file = os.path.join(media_folder_full_path, 'frame_mapping.json')
+        
+        # Check if frame_mapping.json already exists
+        if detect_sharpness and os.path.exists(frame_mapping_file):
+            print("\n" + "="*60)
+            print("REUSING EXISTING SHARPNESS DATA")
+            print("="*60)
+            print(f"Found existing frame_mapping.json, loading sharpness data...")
+
+            # Load existing frame mapping
+            with open(frame_mapping_file, 'r') as f:
+                frame_mapping = json.load(f)
+
+            # Convert frame_mapping back to selected_frames format
+            selected_frames = [{'frame': info['original_frame'], 'time': info['time'], 'sharpness': info['sharpness']} 
+                               for info in frame_mapping.values()]
+
+            # Generate chart from loaded data
+            analyzer = SharpnessAnalyzer(crop_size=crop_size, ffmpeg_path=str(args['ffmpeg']))
+            video_basename = os.path.splitext(os.path.basename(filename))[0]
+            chart_path = os.path.join(media_folder_full_path, f'{video_basename}_sharpness.html')
+            analyzer.generate_sharpness_chart(chart_path, selected_frames, threshold, video_basename)
+
+        elif detect_sharpness:
+            # SHARPNESS-BASED FRAME SELECTION
+            print("\n" + "="*60)
+            print("SHARPNESS-BASED FRAME SELECTION ENABLED")
+            print("="*60)
+
+            analyzer = SharpnessAnalyzer(crop_size=crop_size, ffmpeg_path=str(args['ffmpeg']))
+            max_seconds = args.get('max_seconds')
+
+            # Analyze frames for sharpness
+            frame_data = analyzer.analyze_frames(filename, max_seconds=max_seconds)
+
+            if not frame_data:
+                print("Warning: No frames could be analyzed, falling back to regular extraction")
+                detect_sharpness = False
+            else:
+                # Select best frames based on target FPS and threshold
+                selected_frames = analyzer.select_best_frames(args['frame_rate'], threshold)
+
+                # Generate sharpness chart HTML
+                media_folder_full_path = str(args["media_folder_full_path"].resolve())
+                video_basename = os.path.splitext(os.path.basename(filename))[0]
+                chart_path = os.path.join(media_folder_full_path, f'{video_basename}_sharpness.html')
+                analyzer.generate_sharpness_chart(chart_path, selected_frames, threshold, video_basename)
+
+                if not selected_frames:
+                    print("Warning: No frames passed the threshold filter!")
+                    if threshold is not None:
+                        print(f"Consider lowering the threshold (current: {threshold})")
+                    return
+
+        # If sharpness-based selection is active and frames have been selected:
+        if detect_sharpness and selected_frames:
+            frame_nums = [f['frame'] for f in selected_frames]
+            
+            # Apply frame range filter if specified
+            startf = args.get('startf')
+            endf = args.get('endf')
+            if startf is not None or endf is not None:
+                original_count = len(frame_nums)
+                # Convert to 0-based for comparison
+                start_idx = (startf - 1) if startf is not None else 0
+                end_idx = (endf - 1) if endf is not None else float('inf')
+                frame_nums = [n for n in frame_nums if start_idx <= n <= end_idx]
+                print(f"Frame range filter: {original_count} -> {len(frame_nums)} frames (startf={startf}, endf={endf})")
+            
+            select_expr = '+'.join([f'eq(n\\,{n})' for n in frame_nums])
+
+            print(f"\nExtracting {len(frame_nums)} selected frames...")
+
+            # Store frame mapping for reference
+            frame_mapping_file = os.path.join(media_folder_full_path, 'frame_mapping.json')
+            frame_mapping = {str(i+1): {'original_frame': f['frame'], 'time': f['time'], 'sharpness': f['sharpness']} 
+                             for i, f in enumerate(selected_frames)}
+            with open(frame_mapping_file, 'w') as f:
+                json.dump(frame_mapping, f, indent=2)
+
+            # Extract selected frames
+            cmd = [
+                "-i", filename,
+                "-vf", f"select={select_expr}",
+                "-vsync", "0",
+                "-q:v", str(args["quality"]),
+                "{}{}{}%06d.jpg".format(fileoutput, os.sep, prefix)
+            ]
+            output = self._ffmpeg(cmd, 1)
+
+            # Rename extracted frames to match original frame numbers
+            print("Renaming frames to original frame numbers...")
+            for output_num, info in frame_mapping.items():
+                original_frame = info['original_frame'] + 1  # Convert to 1-based
+                src = os.path.join(fileoutput, f"{prefix}{int(output_num):06d}.jpg")
+                dst = os.path.join(fileoutput, f"{prefix}{original_frame:06d}.jpg")
+                if os.path.exists(src) and src != dst:
+                    os.rename(src, dst)
+
+            print(f"Extracted {len(frame_mapping)} frames based on sharpness analysis")
+            print("="*60 + "\n")
+            return
+
+        # REGULAR FIXED-FPS EXTRACTION (original behavior)
+        startf = args.get('startf')
+        endf = args.get('endf')
+        
+        # Build filter expression for frame range
+        vf_filters = []
+        if startf is not None or endf is not None:
+            # Use select filter with between() function for frame range
+            # Note: frame numbers in ffmpeg are 0-based, so subtract 1
+            start_idx = (startf - 1) if startf is not None else 0
+            end_idx = (endf - 1) if endf is not None else 999999999
+            vf_filters.append(f"select='between(n\\,{start_idx}\\,{end_idx})'")
+            print(f"Frame range: extracting frames {startf if startf else 1} to {endf if endf else 'end'}")
+        
+        # Build fps filter
+        vf_filters.append(f"fps={args['frame_rate']}")
+        
         cmd = [
-            "-i", filename, 
-            "-r", str(args["frame_rate"]), 
+            "-i", filename
+        ]
+        
+        if vf_filters:
+            cmd.extend(["-vf", ','.join(vf_filters)])
+        else:
+            cmd.extend(["-r", str(args["frame_rate"])])
+        
+        cmd.extend([
             "-q:v", str(args["quality"]), 
             "{}{}{}%06d.jpg".format(fileoutput, os.sep, prefix)
-        ]
+        ])
 
         output = self._ffmpeg(cmd, 1)
         
@@ -601,63 +796,446 @@ class GoProFrameMaker(GoProFrameMakerParent):
             trackmapSecond = "0:{}".format(5)
 
         track0 = "{}{}{}".format(fileoutput, os.sep, 'track0')
-        if os.path.exists(track0):
-            shutil.rmtree(track0)
-        os.makedirs(track0, exist_ok=True) 
         track5 = "{}{}{}".format(fileoutput, os.sep, 'track5')
-        if os.path.exists(track5):
-            shutil.rmtree(track5)
-        os.makedirs(track5, exist_ok=True) 
-        cmd = [
-            "-i", filename,
-            "-map", trackmapFirst,
-            "-r", str(args["frame_rate"]), 
-            "-q:v", str(args["quality"]),
-            track0 + os.sep + "%06d.jpg",
-            "-map", trackmapSecond,
-            "-r", str(args["frame_rate"]),
-            "-q:v", str(args["quality"]), 
-            track5 + os.sep + "%06d.jpg"
-        ]
         
-        output = self._ffmpeg(cmd, 1)
+        # Check if sharpness detection is enabled
+        detect_sharpness = args.get('detect_sharpness', False)
+        crop_size = args.get('crop_size', 256)
+        threshold = args.get('threshold', None)
+        frame_mapping_file = os.path.join(media_folder_full_path, 'frame_mapping.json')
+        
+        selected_frames = None  # Will be populated either from cache or analysis
+        
+        # Check if tracks already exist with images - if so, skip ffmpeg extraction
+        track0_exists = os.path.exists(track0) and len(fnmatch.filter(os.listdir(track0), '*.jpg')) > 0
+        track5_exists = os.path.exists(track5) and len(fnmatch.filter(os.listdir(track5), '*.jpg')) > 0
+        
+        # Check if frame_mapping.json already exists (reuse it if available)
+        if detect_sharpness and os.path.exists(frame_mapping_file):
+            print("\n" + "="*60)
+            print("REUSING EXISTING SHARPNESS DATA")
+            print("="*60)
+            print(f"Found existing frame_mapping.json, loading sharpness data...")
+            
+            # Load existing frame mapping
+            with open(frame_mapping_file, 'r') as f:
+                frame_mapping = json.load(f)
+            
+            # Convert frame_mapping back to selected_frames format
+            selected_frames = [{'frame': info['original_frame'], 'time': info['time'], 'sharpness': info['sharpness']} 
+                             for info in frame_mapping.values()]
+            
+            # Generate chart from loaded data
+            analyzer = SharpnessAnalyzer(crop_size=crop_size, ffmpeg_path=str(args['ffmpeg']))
+            analyzer.frame_data = selected_frames
+            analyzer.frame_data = selected_frames
+            video_basename = os.path.splitext(os.path.basename(filename))[0]
+            chart_path = os.path.join(media_folder_full_path, f'{video_basename}_sharpness.html')
+            analyzer.generate_sharpness_chart(chart_path, selected_frames, threshold, video_basename)
+            
+            detect_sharpness = True  # Mark as successfully loaded
+        
+        if track0_exists and track5_exists:
+            logging.info("Track folders already exist with images, skipping ffmpeg extraction...")
+            print("Track folders already exist with images, skipping ffmpeg extraction...")
+        else:
+            # Tracks need to be created/recreated
+            if selected_frames is not None:
+                # We loaded sharpness data from cache, but tracks don't exist yet
+                # Need to extract the frames using the cached frame list
+                print("Cached sharpness data loaded, extracting frames using cached selection...")
+                
+                # Create track folders
+                if os.path.exists(track0):
+                    shutil.rmtree(track0)
+                os.makedirs(track0, exist_ok=True) 
+                if os.path.exists(track5):
+                    shutil.rmtree(track5)
+                os.makedirs(track5, exist_ok=True)
+                
+                # Use cached selected_frames for extraction
+                detect_sharpness = True
+            else:
+                # Remove and recreate track folders for fresh extraction
+                if os.path.exists(track0):
+                    shutil.rmtree(track0)
+                os.makedirs(track0, exist_ok=True) 
+                if os.path.exists(track5):
+                    shutil.rmtree(track5)
+                os.makedirs(track5, exist_ok=True) 
+            
+            if detect_sharpness and selected_frames is None:
+                # SHARPNESS-BASED FRAME SELECTION (only if not loaded from cache)
+                # Analyze video and extract only the best frames
+                print("\n" + "="*60)
+                print("SHARPNESS-BASED FRAME SELECTION ENABLED")
+                print("="*60)
+                
+                analyzer = SharpnessAnalyzer(crop_size=crop_size, ffmpeg_path=str(args['ffmpeg']))
+                max_seconds = args.get('max_seconds')
+                
+                # Analyze frames for sharpness
+                frame_data = analyzer.analyze_frames(filename, max_seconds=max_seconds)
+                
+                if not frame_data:
+                    print("Warning: No frames could be analyzed, falling back to regular extraction")
+                    detect_sharpness = False
+                else:
+                    # Select best frames based on target FPS and threshold
+                    selected_frames = analyzer.select_best_frames(args['frame_rate'], threshold)
+                    
+                    # Generate sharpness chart HTML
+                    video_basename = os.path.splitext(os.path.basename(filename))[0]
+                    chart_path = os.path.join(media_folder_full_path, f'{video_basename}_sharpness.html')
+                    analyzer.generate_sharpness_chart(chart_path, selected_frames, threshold, video_basename)
+                    
+                    if not selected_frames:
+                        print("Warning: No frames passed the threshold filter!")
+                        if threshold is not None:
+                            print(f"Consider lowering the threshold (current: {threshold})")
+                        return filename
+            
+            # Extract frames if sharpness detection is enabled and we have selected_frames
+            if detect_sharpness and selected_frames is not None:
+                # Build select filter expression for the selected frames
+                # Frame numbers from analyzer are 0-based
+                frame_nums = [f['frame'] for f in selected_frames]
+                
+                # Apply frame range filter if specified
+                startf = args.get('startf')
+                endf = args.get('endf')
+                if startf is not None or endf is not None:
+                    original_count = len(frame_nums)
+                    # Convert to 0-based for comparison
+                    start_idx = (startf - 1) if startf is not None else 0
+                    end_idx = (endf - 1) if endf is not None else float('inf')
+                    frame_nums = [n for n in frame_nums if start_idx <= n <= end_idx]
+                    selected_frames = [f for f in selected_frames if start_idx <= f['frame'] <= end_idx]
+                    print(f"Frame range filter: {original_count} -> {len(frame_nums)} frames (startf={startf}, endf={endf})")
+                
+                # Extract selected frames using select filter
+                # Output frame numbers will be sequential (000001.jpg, 000002.jpg, etc.)
+                # We need to map these back to original frame numbers later
+                select_expr = '+'.join([f'eq(n\\,{n})' for n in frame_nums])
+                
+                print(f"\nExtracting {len(frame_nums)} selected frames...")
+                
+                # Store frame mapping (output_num -> original_frame_num) if not already cached
+                # This is needed because ffmpeg select will output sequential numbers
+                frame_mapping_file = os.path.join(media_folder_full_path, 'frame_mapping.json')
+                if not os.path.exists(frame_mapping_file):
+                    frame_mapping = {str(i+1): {'original_frame': f['frame'], 'time': f['time'], 'sharpness': f['sharpness']} 
+                                    for i, f in enumerate(selected_frames)}
+                    with open(frame_mapping_file, 'w') as f:
+                        json.dump(frame_mapping, f, indent=2)
+                else:
+                    # Load existing mapping
+                    with open(frame_mapping_file, 'r') as f:
+                        frame_mapping = json.load(f)
+                
+                # Extract track0 (front camera)
+                cmd_track0 = [
+                    "-i", filename,
+                    "-map", trackmapFirst,
+                    "-vf", f"select={select_expr}",
+                    "-vsync", "0",
+                    "-q:v", str(args["quality"]),
+                    track0 + os.sep + "%06d.jpg"
+                ]
+                output = self._ffmpeg(cmd_track0, 1)
+                
+                # Extract track5 (back camera)
+                cmd_track5 = [
+                    "-i", filename,
+                    "-map", trackmapSecond,
+                    "-vf", f"select={select_expr}",
+                    "-vsync", "0",
+                    "-q:v", str(args["quality"]),
+                    track5 + os.sep + "%06d.jpg"
+                ]
+                output = self._ffmpeg(cmd_track5, 1)
+                
+                # Rename extracted frames to match original frame numbers
+                # This maintains compatibility with the rest of the pipeline
+                print("Renaming frames to original frame numbers...")
+                for output_num, info in frame_mapping.items():
+                    original_frame = info['original_frame'] + 1  # Convert to 1-based
+                    src0 = os.path.join(track0, f"{int(output_num):06d}.jpg")
+                    dst0 = os.path.join(track0, f"{original_frame:06d}.jpg")
+                    if os.path.exists(src0) and src0 != dst0:
+                        os.rename(src0, dst0)
+                    
+                    src5 = os.path.join(track5, f"{int(output_num):06d}.jpg")
+                    dst5 = os.path.join(track5, f"{original_frame:06d}.jpg")
+                    if os.path.exists(src5) and src5 != dst5:
+                        os.rename(src5, dst5)
+                
+                print(f"Extracted {len(frame_mapping)} frames based on sharpness analysis")
+                print("="*60 + "\n")
+            
+            if not detect_sharpness:
+                # REGULAR FIXED-FPS EXTRACTION (original behavior)
+                startf = args.get('startf')
+                endf = args.get('endf')
+                
+                # Build filter expression for frame range
+                vf_filter = None
+                if startf is not None or endf is not None:
+                    # Use select filter with between() function for frame range
+                    start_idx = (startf - 1) if startf is not None else 0
+                    end_idx = (endf - 1) if endf is not None else 999999999
+                    vf_filter = f"select='between(n\\,{start_idx}\\,{end_idx})',setpts=N/FRAME_RATE/TB"
+                    print(f"Frame range: extracting frames {startf if startf else 1} to {endf if endf else 'end'}")
+                
+                cmd = [
+                    "-i", filename,
+                    "-map", trackmapFirst
+                ]
+                
+                if vf_filter:
+                    cmd.extend(["-vf", vf_filter, "-vsync", "0"])
+                else:
+                    cmd.extend(["-r", str(args["frame_rate"])])
+                
+                cmd.extend([
+                    "-q:v", str(args["quality"]),
+                    track0 + os.sep + "%06d.jpg",
+                    "-map", trackmapSecond
+                ])
+                
+                if vf_filter:
+                    cmd.extend(["-vf", vf_filter, "-vsync", "0"])
+                else:
+                    cmd.extend(["-r", str(args["frame_rate"])])
+                
+                cmd.extend([
+                    "-q:v", str(args["quality"]), 
+                    track5 + os.sep + "%06d.jpg"
+                ])
+                
+                output = self._ffmpeg(cmd, 1)
 
         total_images = fnmatch.filter(os.listdir("{}{}{}".format(media_folder_full_path, os.sep, 'track0')), '*.jpg')
+        total_images.sort()
 
-        imgWidth = videoData['video_field_data']['SourceImageWidth']
-        if imgWidth == 4096:
-            _w = 5376
-        elif imgWidth == 2272:
-            _w = 3072
+        # Build frame_numbers respecting max_seconds
+        all_frame_numbers = [int(os.path.splitext(f)[0]) for f in total_images]
+        max_seconds = args.get('max_seconds')
+        if max_seconds is not None:
+            max_frame_count = max(1, int(max_seconds * args['frame_rate']))
+            frame_numbers = all_frame_numbers[:max_frame_count]
         else:
-            _w = imgWidth
-        
-        try:
-            if args['max_sphere'] == None:
-                if platform.system() == "Windows":
-                    max_sphere = ".{}max2sphere-batch{}MAX2spherebatch.exe".format(os.sep, os.sep)
-                else:
-                    max_sphere = ".{}max2sphere-batch{}MAX2spherebatch".format(os.sep, os.sep)
-            else:
-                max_sphere = str(args['max_sphere'].resolve()).strip()
+            frame_numbers = all_frame_numbers
+        max_frames = len(frame_numbers)
 
-            cmd = [
-                max_sphere, '-w', str(imgWidth), '-n', '1', '-m', str(len(total_images)), 
-                '-o', '{}{}{}'.format(media_folder_full_path, os.sep, '%06d.jpg'),
-                '{}{}{}'.format(media_folder_full_path, os.sep, 'track%d/%06d.jpg')
-            ]
-            print(max_sphere)
-            output = subprocess.run(cmd, capture_output=True)
-            #Max2Sphere(max_sphere, _w, media_folder_full_path, track0, track5)
+        # Get video duration via ffprobe
+        try:
+            _probe = subprocess.run(
+                ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', filename],
+                capture_output=True, text=True, check=True,
+            )
+            duration = float(json.loads(_probe.stdout)['format']['duration'])
+        except Exception:
+            duration = max_frames / args['frame_rate'] if args['frame_rate'] else float(max_frames)
+
+        try:
+            # Determine template and output size from the first frame pair
+            which_template, fw, fh = _max2fisheye.check_frames(
+                os.path.join(track0, total_images[0]),
+                os.path.join(track5, total_images[0]),
+            )
+            
+            # Determine which modes to run
+            fisheye_only = args.get('fisheye_only', False)
+            e360_only = args.get('e360_only', False)
+            run_fisheye = not e360_only  # Run fisheye unless --360only is set
+            run_360 = not fisheye_only   # Run 360 unless --fisheyeonly is set
+            
+            antialias = int(args.get('antialias', 2))
+            seq_tmpl = os.path.join(media_folder_full_path, 'track%d', '%06d.jpg')
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # FISHEYE IMAGE GENERATION
+            # ═══════════════════════════════════════════════════════════════════
+            if run_fisheye:
+                # If lens0/lens1 already exist in main folder, skip fisheye generation.
+                existing_lens0 = fnmatch.filter(os.listdir(media_folder_full_path), 'lens0_*.jpg')
+                existing_lens1 = fnmatch.filter(os.listdir(media_folder_full_path), 'lens1_*.jpg')
+                front_folder = os.path.join(media_folder_full_path, 'front')
+                back_folder = os.path.join(media_folder_full_path, 'back')
+                existing_front = os.path.exists(front_folder) and len(fnmatch.filter(os.listdir(front_folder), '*.jpg')) > 0
+                existing_back = os.path.exists(back_folder) and len(fnmatch.filter(os.listdir(back_folder), '*.jpg')) > 0
+
+                skip_fisheye = False
+                if existing_lens0 and existing_lens1:
+                    logging.info("Existing lens0/lens1 fisheye images found, skipping fisheye generation.")
+                    print("Existing lens0/lens1 fisheye images found, skipping fisheye generation...")
+                    skip_fisheye = True
+                elif existing_front and existing_back:
+                    logging.info("Existing front/back fisheye images found, skipping fisheye generation.")
+                    print("Existing front/back fisheye images found, skipping fisheye generation...")
+                    skip_fisheye = True
+
+                if skip_fisheye:
+                    logging.info("Skipping fisheye render and using existing images")
+                    print("Skipping fisheye render and using existing images")
+                else:
+                    # Use fisheye_width from args if provided, otherwise default to 2800
+                    if args.get('fisheye_width') is not None:
+                        out_size = (args['fisheye_width'] // 4) * 4
+                    else:
+                        out_size = 2800
+
+                    lut_file = args.get('lut_file')
+                    if lut_file and os.path.isfile(lut_file):
+                        logging.info("Loading fisheye lookup table from: {}".format(lut_file))
+                        print("Loading fisheye lookup table from: {}".format(lut_file))
+                        import numpy as _np
+                        _d = _np.load(lut_file)
+                        face_lut, u_lut, v_lut = _d['face'], _d['u'], _d['v']
+                    else:
+                        if lut_file:
+                            print("Warning: --lut-file '{}' not found, generating LUT instead.".format(lut_file))
+                        logging.info("Building fisheye lookup table (out_size={}, aa={})...".format(out_size, antialias))
+                        print("Building fisheye lookup table (out_size={}, aa={})...".format(out_size, antialias))
+                        face_lut, u_lut, v_lut = _max2fisheye.build_lookup_table(
+                            out_size, antialias, which_template,
+                        )
+
+                    # Output: lens0 = front fisheye, lens1 = back fisheye
+                    out_tmpl = os.path.join(media_folder_full_path, 'lens%d_%06d.jpg')
+
+                    logging.info("Rendering fisheye frames...")
+
+                    # Extract and integrate gyro for per-frame roll
+                    gyro_samples = parse_gpmf_gyro(filename)
+                    gyro_roll = {}
+                    if gyro_samples:
+                        gyro_roll = integrate_gyro_roll(gyro_samples, duration, args['frame_rate'], max_frames)
+
+                    # Use multiprocessing to parallelize fisheye generation
+                    num_cores = max(1, cpu_count() - 1)
+
+                    process_args = []
+                    for nframe in frame_numbers:
+                        process_args.append((
+                            nframe, seq_tmpl, face_lut, u_lut, v_lut, out_size, antialias,
+                            which_template, out_tmpl, bool(args.get('debug', False)),
+                            gyro_roll if gyro_roll else None
+                        ))
+                    
+                    # Process with progress bar - use imap_unordered for real-time updates
+                    total_frames = len(frame_numbers)
+                    completed = 0
+                    failed_frames = []
+                    
+                    with Pool(processes=num_cores) as pool:
+                        # starmap processes args as tuples
+                        for result in pool.starmap(_process_fisheye_frame, process_args):
+                            nframe, success = result
+                            if not success:
+                                failed_frames.append(nframe)
+                            completed += 1
+                            # Progress bar updates with each completed frame
+                            filled = int(45 * completed / total_frames)
+                            bar = '█' * filled + '░' * (45 - filled)
+                            pct = completed / total_frames * 100
+                            print(f'\r  Fisheye   |{bar}| {completed}/{total_frames} ({pct:.1f}%)', end='', flush=True)
+                    
+                    print()  # New line after progress bar
+                    
+                    # Check for any failures
+                    if failed_frames:
+                        logging.warning(f"Failed to process {len(failed_frames)} frames: {failed_frames[:10]}")
+                        print(f"Warning: {len(failed_frames)} frames failed to process")
+
+                    # Move front (lens0) to front/ and back (lens1) to back/ subfolders
+                    front_folder = os.path.join(media_folder_full_path, 'front')
+                    back_folder = os.path.join(media_folder_full_path, 'back')
+                    os.makedirs(front_folder, exist_ok=True)
+                    os.makedirs(back_folder, exist_ok=True)
+                    for nframe in frame_numbers:
+                        src_front = os.path.join(media_folder_full_path, 'lens0_{:06d}.jpg'.format(nframe))
+                        dst_front = os.path.join(front_folder, 'front_{:06d}.jpg'.format(nframe))
+                        if os.path.exists(src_front):
+                            os.rename(src_front, dst_front)
+                        src_back = os.path.join(media_folder_full_path, 'lens1_{:06d}.jpg'.format(nframe))
+                        dst_back = os.path.join(back_folder, 'back_{:06d}.jpg'.format(nframe))
+                        if os.path.exists(src_back):
+                            os.rename(src_back, dst_back)
+
+            # ═══════════════════════════════════════════════════════════════════
+            # 360° EQUIRECTANGULAR IMAGE GENERATION
+            # ═══════════════════════════════════════════════════════════════════
+            if run_360:
+                # Default 360 output: 4096×2048
+                out_width_360 = 4096
+                out_height_360 = 2048
+                
+                logging.info("Building 360° equirectangular lookup table ({}×{}, aa={})...".format(
+                    out_width_360, out_height_360, antialias))
+                print("Building 360° equirectangular lookup table ({}×{}, aa={})...".format(
+                    out_width_360, out_height_360, antialias))
+                
+                face_lut_360, u_lut_360, v_lut_360 = _max2sphere.build_lookup_table(
+                    out_width_360, out_height_360, antialias, which_template,
+                )
+                
+                # Output: sphere_NNNNNN.jpg
+                out_tmpl_360 = os.path.join(media_folder_full_path, 'sphere_%06d.jpg')
+                
+                logging.info("Rendering 360° equirectangular frames...")
+                
+                # Use multiprocessing to parallelize 360 generation
+                num_cores = max(1, cpu_count() - 1)
+                
+                process_args_360 = []
+                for nframe in frame_numbers:
+                    process_args_360.append((
+                        nframe, seq_tmpl, face_lut_360, u_lut_360, v_lut_360,
+                        out_width_360, out_height_360, antialias,
+                        which_template, out_tmpl_360, bool(args.get('debug', False))
+                    ))
+                
+                # Process with progress bar
+                total_frames = len(frame_numbers)
+                completed = 0
+                failed_frames_360 = []
+                
+                with Pool(processes=num_cores) as pool:
+                    for result in pool.imap(_process_360_frame_wrapper, process_args_360):
+                        nframe, success = result
+                        if not success:
+                            failed_frames_360.append(nframe)
+                        completed += 1
+                        filled = int(45 * completed / total_frames)
+                        bar = '█' * filled + '░' * (45 - filled)
+                        pct = completed / total_frames * 100
+                        print(f'\r  360°      |{bar}| {completed}/{total_frames} ({pct:.1f}%)', end='', flush=True)
+                
+                print()  # New line after progress bar
+                
+                # Check for any failures
+                if failed_frames_360:
+                    logging.warning(f"Failed to process {len(failed_frames_360)} 360° frames: {failed_frames_360[:10]}")
+                    print(f"Warning: {len(failed_frames_360)} 360° frames failed to process")
+                
+                # Move 360 images to 360/ subfolder
+                e360_folder = os.path.join(media_folder_full_path, '360')
+                os.makedirs(e360_folder, exist_ok=True)
+                for nframe in frame_numbers:
+                    src_360 = os.path.join(media_folder_full_path, 'sphere_{:06d}.jpg'.format(nframe))
+                    dst_360 = os.path.join(e360_folder, '{:06d}.jpg'.format(nframe))
+                    if os.path.exists(src_360):
+                        os.rename(src_360, dst_360)
+
         except Exception as e:
             logging.info(str(e))
             print(str(e))
             exit("Unable to convert 360 deg video.")
 
-        if os.path.exists(track0):
-            shutil.rmtree(track0)
-        if os.path.exists(track5):
-            shutil.rmtree(track5)
+        # Keep track folders for re-running tests (they will be reused on next run)
+        logging.info("Keeping track0 and track5 folders for reuse.")
         return filename
 
     def __getVideoMetadata(self):
@@ -695,7 +1273,16 @@ class GoProFrameMaker(GoProFrameMakerParent):
             'GPSHPositioningError',
             'GPSMeasureMode'
         ]
+        sensorFields = [
+            'ExposureTimes',
+            'ISOSpeeds',
+            'Accelerometer',
+            'Gyroscope',
+            'TimeStamp'
+        ]
         gpsData = []
+        sensorData = []
+        current_timestamp = None
         videoFieldData = {}
         videoFieldData['ProjectionType'] = ''
         videoFieldData['StitchingSoftware'] = ''
@@ -778,18 +1365,61 @@ class GoProFrameMaker(GoProFrameMakerParent):
             data[k] = v
         gpsData.append(data)
 
+        # Parse sensor data (ISO, Shutter Speed, Accelerometer, Gyroscope) with timestamps
+        sensor_anchor = ''
+        sensor_data = {}
+        for elem in root[0]:
+            eltags = elem.tag.split("}")
+            nm = eltags[0].replace("{", "")
+            tag = eltags[-1].strip()
+            if (tag in sensorFields) and (nm == nsmap[Track]):
+                if tag == 'TimeStamp':
+                    # Update current timestamp for subsequent sensor fields
+                    current_timestamp = float(elem.text.strip())
+                elif tag == 'ExposureTimes':
+                    if sensor_anchor != '':
+                        sensorData.append(sensor_data)
+                        sensor_data = {
+                            'ExposureTimes': elem.text.strip(),
+                            'TimeStamp': current_timestamp if current_timestamp is not None else 0.0
+                        }
+                        sensor_anchor = elem.text.strip()
+                    else:
+                        sensor_anchor = elem.text.strip()
+                        sensor_data = {
+                            'ExposureTimes': elem.text.strip(),
+                            'TimeStamp': current_timestamp if current_timestamp is not None else 0.0
+                        }
+                elif tag == 'ISOSpeeds':
+                    sensor_data['ISOSpeeds'] = elem.text.strip()
+                    sensor_data['TimeStamp'] = current_timestamp if current_timestamp is not None else sensor_data.get('TimeStamp', 0.0)
+                elif tag in ['Accelerometer', 'Gyroscope']:
+                    # These are binary data, we'll note their presence
+                    sensor_data[tag] = 'present' if 'Binary data' in elem.text else elem.text.strip()
+        if sensor_data:
+            sensorData.append(sensor_data)
+
         if 'Duration' in videoFieldData:
             _tsm = videoFieldData['Duration'].strip().split(' ')
             if len(_tsm) > 0:
-                _t = float(_tsm[0])
+                _first = _tsm[0]
                 _sm = _tsm[-1]
-                if _sm == 's':
-                    videoFieldData['Duration'] = "00:00:{:06.3F}".format(_t)
+                if ':' in _first:
+                    # Already in H:MM:SS or HH:MM:SS[:mmm] format
+                    _parts = _first.split(':')
+                    _h = int(_parts[0])
+                    _m = int(_parts[1])
+                    _s = float(_parts[2]) if len(_parts) > 2 else 0.0
+                    videoFieldData['Duration'] = "{:02d}:{:02d}:{:06.3f}".format(_h, _m, _s)
+                else:
+                    _t = float(_first)
+                    if _sm == 's':
+                        videoFieldData['Duration'] = "00:00:{:06.3F}".format(_t)
             else:
                 if '.' not in videoFieldData['Duration']:
                     videoFieldData['Duration'] = "{}.000".format(videoFieldData['Duration'].strip())
 
-        output = GoProFrameMakerHelper.gpsTimestamps(gpsData, videoFieldData)
+        output = GoProFrameMakerHelper.gpsTimestamps(gpsData, videoFieldData, sensorData)
         args = self.getArguments()
         output["filename"] = "{}{}{}_video.gpx".format(args["media_folder_full_path"], os.sep, args["media_folder"])
         self.__saveAFile(output["filename"], output['gpx_data'])
@@ -799,7 +1429,8 @@ class GoProFrameMaker(GoProFrameMakerParent):
         return {
             "filename": output["filename"],
             "startTime": output["start_time"],
-            "video_field_data": videoFieldData
+            "video_field_data": videoFieldData,
+            "sensor_data": sensorData
         }
 
     def __gpsTimestamps(self, gpsData, videoFieldData):
@@ -983,14 +1614,11 @@ class GoProFrameMaker(GoProFrameMakerParent):
         t1970 = datetime.datetime.strptime("1970:01:01 00:00:00.000000", "%Y:%m:%d %H:%M:%S.%f")
 
         imageData = {}
-        imageData = ExiftoolGetImagesMetadata(media_folder_full_path, data['images'], imageData)
+        front_images_folder = os.path.join(media_folder_full_path, 'front')
+        images_folder = front_images_folder if os.path.exists(front_images_folder) else media_folder_full_path
+        imageData = ExiftoolGetImagesMetadata(images_folder, data['images'], imageData)
 
         cmdMetaDataAll = []
-        
-        if args["nadir_image"] != "":
-            for image in data['images']:
-                nadir_image = "{}{}{}".format(media_folder_full_path, os.sep, image)
-                AddNadir(nadir_image, args["nadir_image"], args["image_magick_path"], imageData[image], equirectangular, int(args["nadir_percentage"]))
 
         counter = 0
         for img in data['images']:
@@ -1073,6 +1701,71 @@ class GoProFrameMaker(GoProFrameMakerParent):
                 '-GPSPitch={}'.format(ext['gps_pitch_next_degrees']),
                 '-IFD0:Model="{}"'.format(self.removeEntities(data["video_field_data"]["DeviceName"]))
             ]
+            
+            # Add sensor data if available - match by timestamp
+            if 'sensor_data' in data and data['sensor_data']:
+                # Calculate frame timestamp relative to video start
+                args = self.getArguments()
+                video_start = data.get('startTime', start_time)
+                frame_time = (start_time - video_start).total_seconds()
+                
+                # Find the sensor block that matches this frame's timestamp
+                sensor_info = None
+                value_index = 0
+                
+                for i, sensor_block in enumerate(data['sensor_data']):
+                    block_timestamp = sensor_block.get('TimeStamp', 0.0)
+                    # Check if this frame falls within this sensor block's time range
+                    # Each block covers ~1 second with 24 values
+                    if i < len(data['sensor_data']) - 1:
+                        next_timestamp = data['sensor_data'][i + 1].get('TimeStamp', block_timestamp + 1.0)
+                    else:
+                        next_timestamp = block_timestamp + 1.0
+                    
+                    if block_timestamp <= frame_time < next_timestamp:
+                        sensor_info = sensor_block
+                        # Calculate which value index to use within the 24 values
+                        time_within_block = frame_time - block_timestamp
+                        block_duration = next_timestamp - block_timestamp
+                        # There are typically 24 values per block for ~24fps
+                        value_index = int((time_within_block / block_duration) * 24)
+                        value_index = max(0, min(value_index, 23))  # Clamp to 0-23
+                        break
+                
+                # Fallback to simple index matching if timestamp matching fails
+                if sensor_info is None and len(data['sensor_data']) > 0:
+                    sensor_idx = min(counter, len(data['sensor_data']) - 1)
+                    sensor_info = data['sensor_data'][sensor_idx]
+                    value_index = 0
+                
+                if sensor_info:
+                    # Add ISO if available
+                    if 'ISOSpeeds' in sensor_info:
+                        iso_values = sensor_info['ISOSpeeds'].split()
+                        if iso_values and value_index < len(iso_values):
+                            cmdMetaData.append('-ISO={}'.format(iso_values[value_index]))
+                        elif iso_values:
+                            cmdMetaData.append('-ISO={}'.format(iso_values[0]))
+                    
+                    # Add Shutter Speed / Exposure Time if available
+                    if 'ExposureTimes' in sensor_info:
+                        exposure_values = sensor_info['ExposureTimes'].split()
+                        if exposure_values and value_index < len(exposure_values):
+                            cmdMetaData.append('-ExposureTime={}'.format(exposure_values[value_index]))
+                            cmdMetaData.append('-ShutterSpeed={}'.format(exposure_values[value_index]))
+                        elif exposure_values:
+                            cmdMetaData.append('-ExposureTime={}'.format(exposure_values[0]))
+                            cmdMetaData.append('-ShutterSpeed={}'.format(exposure_values[0]))
+                    
+                    # Add note about accelerometer and gyroscope data
+                    if 'Accelerometer' in sensor_info or 'Gyroscope' in sensor_info:
+                        sensor_note = []
+                        if 'Accelerometer' in sensor_info:
+                            sensor_note.append('Accelerometer')
+                        if 'Gyroscope' in sensor_info:
+                            sensor_note.append('Gyroscope')
+                        cmdMetaData.append('-UserComment=Sensor data available: {}'.format(', '.join(sensor_note)))
+            
             if (data["video_field_data"]["ProjectionType"] == "equirectangular") or ("360ProjectionType" in data["video_field_data"]):
                 cmdMetaData.append('-XMP-GPano:StitchingSoftware="Spherical Metadata Tool"')
                 cmdMetaData.append('-XMP-GPano:ProjectionType="equirectangular"')
@@ -1085,7 +1778,7 @@ class GoProFrameMaker(GoProFrameMakerParent):
                 cmdMetaData.append('-XMP-GPano:CroppedAreaLeftPixels="{}"'.format(0))
                 cmdMetaData.append('-XMP-GPano:CroppedAreaTopPixels="{}"'.format(0))
             cmdMetaData.append('-overwrite_original')
-            cmdMetaData.append("{}{}{}".format(media_folder_full_path, os.sep, photo[0]))
+            cmdMetaData.append("{}{}{}".format(images_folder, os.sep, photo[0]))
             cmdMetaDataAll.append(cmdMetaData)
             counter = counter + 1
         ExiftoolInjectImagesMetadata(cmdMetaDataAll)

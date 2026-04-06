@@ -90,9 +90,7 @@ debug=
 * `quality`: sets the extracted quality between 1-6. 1 being the highest quality (but slower processing). This is value used for ffmpeg `-q:v` flag.
 	* default: `1`
 	* options: `1`,`2`,`3`,`4`,`5`,`6`
-* `time_warp`: You NEED to use this if video was shot in timewarp mode, else telemetry will be inaccurate. The script does not support timewarp mode set to Auto (because it's impossible to determine the capture rate). Set the timewarp speed used when shooting in this field
-	* default: blank (not timewarp)
-	* options: `2x`, `5x`, `10x`, `15x`, `30x`
+
 * `logo_image`: Path to logofile used for nadir / watermark
 	* default: blank (do not add logo)
 * `logo_percentage`: overlay size of nadir / watermark between 8 - 20, in increments of 1.
@@ -100,6 +98,38 @@ debug=
 * `debug`: enable debug mode.
 	* Default: `FALSE`
 	* options: `TRUE`,`FALSE`
+
+### Sharpness-Based Frame Selection
+
+Instead of extracting frames at fixed intervals (which may result in blurry frames), you can enable sharpness-based frame selection to analyze every frame in the video and select only the sharpest frames.
+
+```bash
+# Enable sharpness detection with default settings
+python3 gfm.py VIDEO_NAME.mp4 -r 2 --detect-sharpness
+
+# Set minimum quality threshold (0-100) - frames below this are skipped
+python3 gfm.py VIDEO_NAME.mp4 -r 2 --detect-sharpness --threshold 40
+
+# Adjust crop size for sharpness analysis (64, 128, 256, 384, or 512 pixels)
+python3 gfm.py VIDEO_NAME.mp4 -r 2 --detect-sharpness --crop-size 384
+```
+
+**How it works:**
+1. The entire video is analyzed using ffmpeg's `blurdetect` filter on small crop regions (center + 4 corners)
+2. Each frame gets a sharpness score from 0-100 (higher = sharper)
+3. The video is divided into intervals based on your target FPS
+4. The sharpest frame from each interval is selected for extraction
+5. If `--threshold` is set, intervals where even the best frame is below the threshold are skipped
+
+**Options:**
+* `--detect-sharpness`: Enable sharpness-based frame selection (analyzes every frame)
+* `--crop-size`: Size of crop squares for blur analysis (default: 256px). Larger = more accurate but slower
+* `--threshold`: Minimum sharpness score (0-100). Frames/intervals below this are skipped
+
+This is especially useful for:
+- Videos with motion blur from fast movement
+- Handheld footage with occasional shake
+- Ensuring only high-quality frames are extracted for photogrammetry
 
 ## Test cases
 

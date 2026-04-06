@@ -9,6 +9,291 @@ from os import walk
 import itertools
 import gpxpy
 
+
+class SharpnessAnalyzer:
+    """
+    Analyzes video frames for sharpness using ffmpeg's blurdetect filter.
+    Uses crop regions (small squares) to efficiently detect blur without processing entire frames.
+    """
+    
+    def __init__(self, crop_size: int = 256, ffmpeg_path: str = 'ffmpeg'):
+        self.crop_size = crop_size
+        self.ffmpeg_path = ffmpeg_path
+        self.frame_data = []
+        self.video_fps = 0
+        self.total_frames = 0
+        self.duration = 0
+        self.frame_width = 0
+        self.frame_height = 0
+    
+    def get_video_info(self, video_path: str) -> dict:
+        """Get video metadata using ffprobe"""
+        cmd = [
+            'ffprobe', '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format', '-show_streams',
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        info = json.loads(result.stdout)
+        
+        for stream in info.get('streams', []):
+            if stream.get('codec_type') == 'video':
+                fps_str = stream.get('r_frame_rate', '30/1')
+                num, den = map(int, fps_str.split('/'))
+                self.video_fps = num / den if den else 30
+                self.total_frames = int(stream.get('nb_frames', 0))
+                self.frame_width = int(stream.get('width', 1920))
+                self.frame_height = int(stream.get('height', 1080))
+                if self.total_frames == 0:
+                    duration = float(info.get('format', {}).get('duration', 0))
+                    self.total_frames = int(duration * self.video_fps)
+                self.duration = float(info.get('format', {}).get('duration', 0))
+                break
+        
+        return {
+            'fps': self.video_fps,
+            'total_frames': self.total_frames,
+            'duration': self.duration,
+            'width': self.frame_width,
+            'height': self.frame_height
+        }
+    
+    def get_crop_positions(self) -> list:
+        """Calculate 5 crop positions: center + 4 at 50% distance to corners"""
+        if not self.frame_width or not self.frame_height:
+            return [(0, 0)]
+        
+        w, h = self.frame_width, self.frame_height
+        size = self.crop_size
+        
+        # Center position
+        center_x = (w - size) // 2
+        center_y = (h - size) // 2
+        
+        # 50% distance from center to each corner
+        quarter_w = w // 4
+        quarter_h = h // 4
+        
+        positions = [
+            (center_x, center_y),                    # Center
+            (quarter_w, quarter_h),                  # Top-left region
+            (3 * quarter_w - size//2, quarter_h),   # Top-right region  
+            (quarter_w, 3 * quarter_h - size//2),   # Bottom-left region
+            (3 * quarter_w - size//2, 3 * quarter_h - size//2)  # Bottom-right region
+        ]
+        
+        # Ensure crops are within bounds
+        valid_positions = []
+        for x, y in positions:
+            x = max(0, min(x, w - size))
+            y = max(0, min(y, h - size))
+            valid_positions.append((x, y))
+        
+        return valid_positions
+
+    def analyze_frames(self, video_path: str, max_seconds: float = None) -> list:
+        """
+        Analyze all frames in video for sharpness using crop regions.
+        Returns list of dicts with frame number, time, and sharpness score.
+        """
+        self.get_video_info(video_path)
+        crops = self.get_crop_positions()
+        
+        print(f"Analyzing video for sharpness ({len(crops)} crop regions, {self.crop_size}px squares)...")
+        print(f"Video: {self.frame_width}x{self.frame_height}, {self.video_fps:.2f} fps, {self.duration:.1f}s")
+        
+        self.frame_data = []
+        
+        # Build filter for center crop (primary analysis)
+        center_x, center_y = crops[0]
+        
+        # Build input options
+        input_opts = ['-i', video_path]
+        if max_seconds is not None:
+            input_opts = ['-t', str(max_seconds)] + input_opts
+        
+        # Use blurdetect filter for sharpness measurement
+        crop_filter = f"crop={self.crop_size}:{self.crop_size}:{center_x}:{center_y},blurdetect,metadata=print"
+        
+        # Use -map 0:v:0 to select the first video stream (important for .360 files with multiple video tracks)
+        cmd = [self.ffmpeg_path] + input_opts + [
+            '-map', '0:v:0',
+            '-vf', crop_filter,
+            '-f', 'null', '-'
+        ]
+        
+        # Run ffmpeg - metadata output goes to stderr
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, bufsize=1
+        )
+        
+        # Parse blurdetect output
+        blur_pattern = re.compile(r'lavfi\.blur=(\d+\.?\d*)')
+        frame_pattern = re.compile(r'frame:(\d+)\s+pts:\d+\s+pts_time:(\d+\.?\d*)')
+        current_frame = 0
+        current_time = 0.0
+        
+        for line in process.stderr:
+            frame_match = frame_pattern.search(line)
+            if frame_match:
+                current_frame = int(frame_match.group(1))
+                current_time = float(frame_match.group(2))
+                continue
+            
+            blur_match = blur_pattern.search(line)
+            if blur_match:
+                blur_value = float(blur_match.group(1))
+                # Convert blur (0-100+) to sharpness (100-0), clamped
+                sharpness = max(0, min(100, 100 - blur_value * 10))
+                
+                self.frame_data.append({
+                    'frame': current_frame,
+                    'time': current_time,
+                    'blur': blur_value,
+                    'sharpness': sharpness
+                })
+                
+                # Progress indicator every 500 frames
+                if len(self.frame_data) % 500 == 0:
+                    print(f"  Analyzed {len(self.frame_data)} frames...")
+        
+        process.wait()
+        
+        print(f"  Analysis complete: {len(self.frame_data)} frames analyzed")
+        
+        if self.frame_data:
+            avg_sharpness = sum(f['sharpness'] for f in self.frame_data) / len(self.frame_data)
+            min_sharpness = min(f['sharpness'] for f in self.frame_data)
+            max_sharpness = max(f['sharpness'] for f in self.frame_data)
+            print(f"  Sharpness stats: avg={avg_sharpness:.1f}, min={min_sharpness:.1f}, max={max_sharpness:.1f}")
+        
+        return self.frame_data
+    
+    def select_best_frames(self, target_fps: float, threshold: float = None) -> list:
+        """
+        Select the best (sharpest) frame from each interval based on target FPS.
+        Args:
+            target_fps: Desired output frame rate
+            threshold: Minimum sharpness score (0-100). Frames below this are skipped.
+        
+        Returns:
+            List of selected frame dicts with interval info
+        """
+        if not self.frame_data or self.video_fps <= 0:
+            return []
+        
+        # Calculate interval size (how many source frames per output frame)
+        interval = int(self.video_fps / target_fps)
+        if interval < 1:
+            interval = 1
+        
+        selected = []
+        skipped_count = 0
+        num_intervals = (len(self.frame_data) + interval - 1) // interval
+        
+        for i in range(num_intervals):
+            start_idx = i * interval
+            end_idx = min(start_idx + interval, len(self.frame_data))
+            
+            interval_frames = self.frame_data[start_idx:end_idx]
+            if interval_frames:
+                best = max(interval_frames, key=lambda x: x['sharpness'])
+                
+                # Apply threshold filter
+                if threshold is not None and best['sharpness'] < threshold:
+                    skipped_count += 1
+                    continue
+                
+                selected.append({
+                    'interval': i,
+                    'frame': best['frame'],
+                    'time': best['time'],
+                    'sharpness': best['sharpness'],
+                    'blur': best['blur']
+                })
+        
+        if skipped_count > 0:
+            print(f"  Skipped {skipped_count} intervals due to sharpness below threshold ({threshold})")
+        
+        print(f"  Selected {len(selected)} frames from {num_intervals} intervals")
+        
+        return selected
+    
+    def get_frame_numbers_for_extraction(self, target_fps: float, threshold: float = None) -> list:
+        """
+        Get 1-based frame numbers suitable for extraction.
+        Frame numbers are 1-based to match ffmpeg output naming (000001.jpg, etc.)
+        """
+        selected = self.select_best_frames(target_fps, threshold)
+        # Convert 0-based frame indices to 1-based frame numbers
+        return [f['frame'] + 1 for f in selected]
+    
+    def generate_sharpness_chart(self, output_path: str, selected_frames: list = None, 
+                                  threshold: float = None, video_name: str = "Video"):
+        """
+        Generate a standalone HTML file with an interactive sharpness chart.
+        No external dependencies required - pure HTML/CSS/JavaScript with Canvas.
+        """
+        if not self.frame_data:
+            print("No frame data to generate chart")
+            return
+        
+        # Prepare data for the chart
+        sharpness_values = [f['sharpness'] for f in self.frame_data]
+        
+        # Selected frame indices (if provided)
+        selected_indices = set()
+        if selected_frames:
+            selected_indices = {f['frame'] for f in selected_frames}
+        
+        # Statistics
+        avg_sharpness = sum(sharpness_values) / len(sharpness_values)
+        min_sharpness = min(sharpness_values)
+        max_sharpness = max(sharpness_values)
+        
+        # Convert data to JSON for JavaScript
+        chart_data = json.dumps([{
+            'frame': f['frame'],
+            'time': round(f['time'], 3),
+            'sharpness': round(f['sharpness'], 2),
+            'selected': f['frame'] in selected_indices
+        } for f in self.frame_data])
+        
+        threshold_js = threshold if threshold is not None else 'null'
+        threshold_legend = '<div class="legend-item"><div class="legend-color" style="background: #ff6b6b;"></div><span>Threshold</span></div>' if threshold else ''
+        
+        # Load HTML template
+        template_path = os.path.join(os.path.dirname(__file__), 'templates', 'sharpness_chart.html')
+        with open(template_path, 'r') as f:
+            html_content = f.read()
+        
+        # Replace template variables; avoid .format() to keep braces in CSS/JS literal
+        replacements = {
+            'video_name': video_name,
+            'frame_count': len(self.frame_data),
+            'duration': f"{self.duration:.1f}",
+            'fps': f"{self.video_fps:.2f}",
+            'avg_sharpness': f"{avg_sharpness:.1f}",
+            'min_sharpness': f"{min_sharpness:.1f}",
+            'max_sharpness': f"{max_sharpness:.1f}",
+            'selected_count': len(selected_frames) if selected_frames else 0,
+            'threshold_display': threshold if threshold is not None else 'None',
+            'threshold_legend': threshold_legend,
+            'chart_data': chart_data,
+            'threshold_js': threshold_js,
+        }
+
+        for key, value in replacements.items():
+            html_content = html_content.replace(f"{{{key}}}", str(value))
+
+        with open(output_path, 'w') as f:
+            f.write(html_content)
+        
+        print(f"  Sharpness chart saved to: {output_path}")
+
+
 class GoProFrameMakerHelper():
     def __init__(self):
         pass
@@ -112,7 +397,7 @@ class GoProFrameMakerHelper():
             #print((start_latitude, start_longitude), (end_latitude, end_longitude))
             #print("AC: {}, BC: {}, azimuth1: {}, azimuth2: {}, \ntime: {}, distance: {} seconds: {}\n\n\n".format(AC, BC, azimuth1, azimuth2, Decimal(time_diff), distance, gps_epoch_seconds))
 
-            gps_elevation_change_next_meters = Decimal(end_altitude - start_altitude)
+            gps_elevation_change_next_meters = float(end_altitude - start_altitude)
             gps_velocity_east_next_meters_second = GoProFrameMakerHelper.decimalDivide( AC, time_diff ) 
             gps_velocity_north_next_meters_second = GoProFrameMakerHelper.decimalDivide( BC, time_diff )
             gps_velocity_up_next_meters_second = GoProFrameMakerHelper.decimalDivide( gps_elevation_change_next_meters, time_diff )
@@ -179,7 +464,16 @@ class GoProFrameMakerHelper():
             'GPSHPositioningError',
             'GPSMeasureMode'
         ]
+        sensorFields = [
+            'ExposureTimes',
+            'ISOSpeeds',
+            'Accelerometer',
+            'Gyroscope',
+            'TimeStamp'
+        ]
         gpsData = []
+        sensorData = []
+        current_timestamp = None
         videoFieldData = {}
         videoFieldData['ProjectionType'] = ''
         videoFieldData['StitchingSoftware'] = ''
@@ -262,23 +556,67 @@ class GoProFrameMakerHelper():
             data[k] = v
         gpsData.append(data)
 
+        # Parse sensor data (ISO, Shutter Speed, Accelerometer, Gyroscope) with timestamps
+        sensor_anchor = ''
+        sensor_data = {}
+        for elem in root[0]:
+            eltags = elem.tag.split("}")
+            nm = eltags[0].replace("{", "")
+            tag = eltags[-1].strip()
+            if (tag in sensorFields) and (nm == nsmap[Track]):
+                if tag == 'TimeStamp':
+                    # Update current timestamp for subsequent sensor fields
+                    current_timestamp = float(elem.text.strip())
+                elif tag == 'ExposureTimes':
+                    if sensor_anchor != '':
+                        sensorData.append(sensor_data)
+                        sensor_data = {
+                            'ExposureTimes': elem.text.strip(),
+                            'TimeStamp': current_timestamp if current_timestamp is not None else 0.0
+                        }
+                        sensor_anchor = elem.text.strip()
+                    else:
+                        sensor_anchor = elem.text.strip()
+                        sensor_data = {
+                            'ExposureTimes': elem.text.strip(),
+                            'TimeStamp': current_timestamp if current_timestamp is not None else 0.0
+                        }
+                elif tag == 'ISOSpeeds':
+                    sensor_data['ISOSpeeds'] = elem.text.strip()
+                    sensor_data['TimeStamp'] = current_timestamp if current_timestamp is not None else sensor_data.get('TimeStamp', 0.0)
+                elif tag in ['Accelerometer', 'Gyroscope']:
+                    # These are binary data, we'll note their presence
+                    sensor_data[tag] = 'present' if 'Binary data' in elem.text else elem.text.strip()
+        if sensor_data:
+            sensorData.append(sensor_data)
+
         if 'Duration' in videoFieldData:
             _tsm = videoFieldData['Duration'].strip().split(' ')
             if len(_tsm) > 0:
-                _t = float(_tsm[0])
+                _first = _tsm[0]
                 _sm = _tsm[-1]
-                if _sm == 's':
-                    videoFieldData['Duration'] = "00:00:{:06.3F}".format(_t)
+                if ':' in _first:
+                    # Already in H:MM:SS or HH:MM:SS[:mmm] format
+                    _parts = _first.split(':')
+                    _h = int(_parts[0])
+                    _m = int(_parts[1])
+                    _s = float(_parts[2]) if len(_parts) > 2 else 0.0
+                    videoFieldData['Duration'] = "{:02d}:{:02d}:{:06.3f}".format(_h, _m, _s)
+                else:
+                    _t = float(_first)
+                    if _sm == 's':
+                        videoFieldData['Duration'] = "00:00:{:06.3F}".format(_t)
             else:
                 if '.' not in videoFieldData['Duration']:
                     videoFieldData['Duration'] = "{}.000".format(videoFieldData['Duration'].strip())
         return {
             'gps_data': gpsData,
-            'video_field_data': videoFieldData
+            'video_field_data': videoFieldData,
+            'sensor_data': sensorData
         }
 
     @staticmethod
-    def gpsTimestamps(gpsData, videoFieldData):
+    def gpsTimestamps(gpsData, videoFieldData, sensorData=None):
         
         gpx = gpxpy.gpx.GPX()
 
@@ -318,7 +656,7 @@ class GoProFrameMakerHelper():
                 _ms = 1 if _ms < 1 else _ms
                 for gps in start_gps["GPSData"]:
                     tBlock = gps.copy()
-                    tBlock["GPSDateTime"] = new[icounter]
+                    tBlock["GPSDateTime"] = new[min(icounter, len(new) - 1)]
                     tBlock["GPSMeasureMode"] = start_gps["GPSMeasureMode"]
                     tBlock["GPSHPositioningError"] = start_gps["GPSHPositioningError"]
                     Timestamps.append(tBlock)
@@ -356,7 +694,7 @@ class GoProFrameMakerHelper():
                 _ms = 1 if _ms < 1 else _ms
                 for gps in start_gps["GPSData"]:
                     tBlock = gps.copy()
-                    tBlock["GPSDateTime"] = new[icounter]
+                    tBlock["GPSDateTime"] = new[min(icounter, len(new) - 1)]
                     tBlock["GPSMeasureMode"] = start_gps["GPSMeasureMode"]
                     tBlock["GPSHPositioningError"] = start_gps["GPSHPositioningError"]
                     Timestamps.append(tBlock)
@@ -428,7 +766,8 @@ class GoProFrameMakerHelper():
         return {
             "gpx_data": gpxData,
             "start_time": Timestamps[0]['GPSDateTime'],
-            "end_time": final_end_time
+            "end_time": final_end_time,
+            "sensor_data": sensorData if sensorData else []
         }
 
 
@@ -436,16 +775,9 @@ class GoProFrameMakerHelper():
     def getConfig():
         #read config file
         values_required = [
-            'magick_path',
             'ffmpeg_path',
             'frame_rate',
-            'time_warp',
             'quality',
-            'nadir_image',
-            'nadir_percentage',
-            'max_sphere',
-            'fusion_sphere',
-            'fusion_params',
             'debug'
         ]
         data = {}
@@ -471,16 +803,9 @@ class GoProFrameMakerHelper():
 
                     default = {
                         'debug': config.getboolean('DEFAULT', 'debug'),
-                        'image_magick_path': config['DEFAULT'].get('magick_path'),
                         'ffmpeg_path': config['DEFAULT'].get('ffmpeg_path', ffmpeg),
                         'frame_rate': float(config['DEFAULT'].get('frame_rate', '0.5')),
-                        'time_warp': config['DEFAULT'].get('time_warp', '5x'),
-                        'quality': int(config['DEFAULT'].get('quality', '1')),
-                        'nadir_image': config['DEFAULT'].get('nadir_image'),
-                        'nadir_percentage': int(config['DEFAULT'].get('nadir_percentage')),
-                        'max_sphere': config['DEFAULT'].get('max_sphere'),
-                        'fusion_sphere': config['DEFAULT'].get('fusion_sphere'),
-                        'fusion_sphere_params': config['DEFAULT'].get('fusion_params')
+                        'quality': int(config['DEFAULT'].get('quality', '1'))
                     }
                     status = True
                 except:
@@ -498,16 +823,14 @@ class GoProFrameMakerHelper():
             'predicted_camera': '',
             'input': '',
             'ffmpeg': '',
-            'max_sphere': '',
-            'fusion_sphere': '',
             'frame_rate': 0.5,
             'quality': 1,
-            'time_warp': None,
-            'nadir_image': '',
-            'nadir_percentage': '',
             'debug': '',
-            'image_magick_path': '',
-            'fusion_sphere_params': ''
+            'detect_sharpness': False,
+            'crop_size': 256,
+            'threshold': None,
+            'startf': None,
+            'endf': None
         }
         errors = []
         info = []
@@ -518,42 +841,26 @@ class GoProFrameMakerHelper():
             errors.append("Only (1) Input files is required in case of max video file and (2) in case of fusion video file.")
             status = False
 
-        #validating input video files for max_sphere
+        #validating input video files for max camera (Python max2sphere used — no binary needed)
         if(args_input_len == 1): 
-            if (args.max_sphere is not None):
-                arguments['max_sphere'] = Path(args.max_sphere)
-                if(arguments['max_sphere'].is_file() == False):
-                    errors.append("{} path does not exists at {}. Please make sure you used correct path!".format(args.max_sphere, str(arguments['max_sphere'].resolve())))
-                    status = False
-            else:
-                info.append("No max2sphere binary is present starting processing without it.")
-                status = False
             #camera should be max
             arguments['predicted_camera'] = 'max'
+            arguments['folder_mode'] = False  # Will be set to True if folder is detected
 
-        #validating input video files for fusion_sphere
-        #should be only (2) video file
+        #validating input video files for fusion camera
+        #should be only (2) video files (front and back)
         elif(args_input_len == 2):
-            if(args.fusion_sphere is not None):
-                arguments['fusion_sphere'] = Path(args.fusion_sphere)
-                if(arguments['fusion_sphere'].is_file() == False):
-                    errors.append("{} path does not exists at {}. Please make sure you used correct path!".format(args.fusion_sphere, str(arguments['fusion_sphere'].resolve())))
-                    status = False
-                else:
-                    #camera should be fusion
-                    arguments['predicted_camera'] = 'fusion'
-                    #sort front/back fusion videos
-                    front = os.path.basename(args.input[0])[0:4]
-                    back = os.path.basename(args.input[1])[0:4]
-                    if((front == 'GPFR') and (back == 'GPBK')):
-                        args.input = [args.input[0], args.input[1]]
-                    elif((front == 'GPBK') and (back == 'GPFR')):
-                        args.input = [args.input[1], args.input[0]]
-                    else:
-                        errors.append("Unidentified video prefix names.")
-                        status = False
+            #camera should be fusion
+            arguments['predicted_camera'] = 'fusion'
+            #sort front/back fusion videos
+            front = os.path.basename(args.input[0])[0:4]
+            back = os.path.basename(args.input[1])[0:4]
+            if((front == 'GPFR') and (back == 'GPBK')):
+                args.input = [args.input[0], args.input[1]]
+            elif((front == 'GPBK') and (back == 'GPFR')):
+                args.input = [args.input[1], args.input[0]]
             else:
-                errors.append("Please provide fusion2sphere binary path along with two videos (front/back).")
+                errors.append("2 input videos provided but cannot identify front (GPFR) and back (GPBK) videos.")
                 status = False
         else:
             errors.append("Please make sure to provide (1) video in case of max camera and (2) in case of fusion camera.")
@@ -565,8 +872,26 @@ class GoProFrameMakerHelper():
             arguments['input'] = [Path(args.input[0])]
             if(arguments['input'][0].is_file()): #input is a list.
                 pass
+            elif(arguments['input'][0].is_dir()):
+                # Check if it's a folder with track0 and track5
+                track0_path = arguments['input'][0] / 'track0'
+                track5_path = arguments['input'][0] / 'track5'
+                if track0_path.is_dir() and track5_path.is_dir():
+                    import fnmatch
+                    track0_images = fnmatch.filter(os.listdir(str(track0_path)), '*.jpg')
+                    track5_images = fnmatch.filter(os.listdir(str(track5_path)), '*.jpg')
+                    if len(track0_images) > 0 and len(track5_images) > 0:
+                        arguments['folder_mode'] = True
+                        info.append("Folder mode detected: using existing track0 ({} images) and track5 ({} images)".format(len(track0_images), len(track5_images)))
+                        info.append("Note: GPS tagging will be skipped as no video file is provided.")
+                    else:
+                        errors.append("Folder {} contains track0 and track5 but they have no .jpg images".format(args.input[0]))
+                        status = False
+                else:
+                    errors.append("Folder {} must contain 'track0' and 'track5' subdirectories with extracted frames".format(args.input[0]))
+                    status = False
             else:
-                errors.append("Input file {} does not exists.".format(args.input[0]))
+                errors.append("Input {} does not exist (must be a video file or folder with track0/track5)".format(args.input[0]))
                 status = False
 
         #validate if the provided input file is actually exists or not.
@@ -600,9 +925,10 @@ class GoProFrameMakerHelper():
         #validating frame rate parameter used for ffmpeg
         if (args.frame_rate is not None):
             frameRate = args.frame_rate
-            fropts = [0.5, 1, 2, 5]
-            if frameRate not in fropts:
-                errors.append("Frame rate {} is not available. Only 0.5, 1, 2, 5 options are available.".format(frameRate))
+            if frameRate <= 0:
+                errors.append("Frame rate {} is not valid. Must be greater than 0.".format(frameRate))
+            elif frameRate > 30:
+                errors.append("Frame rate {} may be too high. Maximum recommended is 30 fps.".format(frameRate))
             else:
                 arguments["frame_rate"] = frameRate
         else:
@@ -620,62 +946,42 @@ class GoProFrameMakerHelper():
         else:
             arguments["quality"] = 1
 
-        #validating time warp parameter used for ffmpeg
-        if (args.time_warp.strip() != ""):
-            timeWarp = str(args.time_warp)
-            twopts = ["2x", "5x", "10x", "15x", "30x"]
-            if timeWarp not in twopts:
-                errors.append("Timewarp mode {} not available. Only 2x, 5x, 10x, 15x, 30x options are available.".format(timeWarp))
+        #validating frame range parameters
+        if hasattr(args, 'startf') and args.startf is not None:
+            if args.startf < 1:
+                errors.append("Starting frame must be >= 1 (got {})".format(args.startf))
             else:
-                arguments["time_warp"] = timeWarp
-        else:
-            arguments["time_warp"] = None
-
-
-        #validating and checking if nadir image exists if present in the arument.
-        if (args.nadir_image is not None):
-            if(Path(args.nadir_image).is_file() == False):
-                errors.append("{} path does not exists at {}. Please make sure you used correct path!".format(args.nadir_image, str(Path(args.nadir_image).resolve())))
-                status = False
-            else:
-                arguments["nadir_image"] = Path(args.nadir_image)
-        else:
-            arguments["nadir_image"] = ''
+                arguments["startf"] = args.startf
         
-        #validating nadir percentage.
-        if (args.nadir_percentage is not None):
-            nadir_percentage = int(args.nadir_percentage)
-            if((nadir_percentage >= 12) and (nadir_percentage <= 20)):
-                nadir_percentage = nadir_percentage
+        if hasattr(args, 'endf') and args.endf is not None:
+            if args.endf < 1:
+                errors.append("Ending frame must be >= 1 (got {})".format(args.endf))
             else:
-                nadir_percentage = 15
-            arguments["nadir_percentage"] = nadir_percentage
-        else:
-            arguments["nadir_percentage"] = 15
-
-        if(args.image_magick_path is not None):
-            if(Path(args.image_magick_path).is_file()):
-                arguments["image_magick_path"] = Path(args.image_magick_path)
-            else:
-                errors.append("{} file does not exists.".format(Path(args.fusion_sphere_params)))
-                status = False
-        else:
-            arguments["image_magick_path"] = 'magick'
-
-        if(args.fusion_sphere_params is not None):
-            if(Path(args.fusion_sphere_params).is_file()):
-                arguments["fusion_sphere_params"] = Path(args.fusion_sphere_params)
-            else:
-                errors.append("{} file does not exists.".format(Path(args.fusion_sphere_params)))
-                status = False
-        else:
-            if(Path('./params.txt').is_file()):
-                arguments["fusion_sphere_params"] = Path('./params.txt')
-            else:
-                errors.append("{} file does not exists.".format(Path('./params.txt')))
-                status = False
-
+                arguments["endf"] = args.endf
         
+        if arguments["startf"] is not None and arguments["endf"] is not None:
+            if arguments["startf"] > arguments["endf"]:
+                errors.append("Starting frame ({}) must be <= ending frame ({})".format(arguments["startf"], arguments["endf"]))
+
+
+        # Validate sharpness detection parameters
+        if hasattr(args, 'detect_sharpness'):
+            arguments['detect_sharpness'] = getattr(args, 'detect_sharpness', False)
+        
+        if hasattr(args, 'crop_size'):
+            crop_size = getattr(args, 'crop_size', 256)
+            if crop_size not in [64, 128, 256, 384, 512]:
+                errors.append("Crop size {} is not valid. Must be one of: 64, 128, 256, 384, 512.".format(crop_size))
+            else:
+                arguments['crop_size'] = crop_size
+        
+        if hasattr(args, 'threshold'):
+            threshold = getattr(args, 'threshold', None)
+            if threshold is not None:
+                if threshold < 0 or threshold > 100:
+                    errors.append("Threshold {} is not valid. Must be between 0 and 100.".format(threshold))
+                else:
+                    arguments['threshold'] = threshold
 
         return {
             'status': status,

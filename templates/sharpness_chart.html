@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sharpness Analysis - {video_name}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e; color: #eee; padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { color: #00d4ff; margin-bottom: 10px; }
+        .stats { 
+            display: flex; gap: 20px; margin: 20px 0; flex-wrap: wrap;
+        }
+        .stat-box {
+            background: #16213e; padding: 15px 25px; border-radius: 8px;
+            border-left: 4px solid #00d4ff;
+        }
+        .stat-box.selected { border-left-color: #00ff88; }
+        .stat-box.threshold { border-left-color: #ff6b6b; }
+        .stat-label { font-size: 12px; color: #888; text-transform: uppercase; }
+        .stat-value { font-size: 24px; font-weight: bold; }
+        .chart-container {
+            background: #16213e; border-radius: 8px; padding: 20px;
+            margin: 20px 0; position: relative;
+        }
+        canvas { width: 100%; height: 400px; }
+        .tooltip {
+            position: absolute; background: rgba(0,0,0,0.9); color: #fff;
+            padding: 10px 15px; border-radius: 6px; font-size: 13px;
+            pointer-events: none; display: none; z-index: 100;
+            border: 1px solid #00d4ff;
+        }
+        .legend {
+            display: flex; gap: 30px; margin-top: 15px; justify-content: center;
+        }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-color { width: 20px; height: 4px; border-radius: 2px; }
+        .controls {
+            display: flex; gap: 15px; margin-bottom: 15px; align-items: center; flex-wrap: wrap;
+        }
+        .controls label { font-size: 14px; color: #888; }
+        .controls input[type="range"] { width: 200px; }
+        .zoom-info { font-size: 12px; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Sharpness Analysis</h1>
+        <p style="color: #888; margin-bottom: 20px;">{video_name} | {frame_count} frames analyzed | {duration}s duration | {fps} fps</p>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-label">Average Sharpness</div>
+                <div class="stat-value">{avg_sharpness}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Min / Max</div>
+                <div class="stat-value">{min_sharpness} - {max_sharpness}</div>
+            </div>
+            <div class="stat-box selected">
+                <div class="stat-label">Selected Frames</div>
+                <div class="stat-value">{selected_count}</div>
+            </div>
+            <div class="stat-box threshold">
+                <div class="stat-label">Threshold</div>
+                <div class="stat-value">{threshold_display}</div>
+            </div>
+        </div>
+        
+        <div class="chart-container">
+            <div class="controls">
+                <label>Zoom: <input type="range" id="zoomRange" min="1" max="20" value="1" step="0.5"></label>
+                <span class="zoom-info" id="zoomInfo">100%</span>
+                <label style="margin-left: 20px;">
+                    <input type="checkbox" id="showSelected" checked> Show selected frames
+                </label>
+            </div>
+            <canvas id="chart"></canvas>
+            <div class="tooltip" id="tooltip"></div>
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #00d4ff;"></div>
+                    <span>Sharpness</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #00ff88; height: 10px; width: 10px; border-radius: 50%;"></div>
+                    <span>Selected Frame</span>
+                </div>
+                {threshold_legend}
+            </div>
+        </div>
+        <p style="color: #666; font-size: 12px; margin-top: 10px;">Drag to pan when zoomed in. Hover for frame details.</p>
+    </div>
+
+    <script>
+        const data = {chart_data};
+        const threshold = {threshold_js};
+        const canvas = document.getElementById('chart');
+        const ctx = canvas.getContext('2d');
+        const tooltip = document.getElementById('tooltip');
+        const zoomRange = document.getElementById('zoomRange');
+        const zoomInfo = document.getElementById('zoomInfo');
+        const showSelectedCheckbox = document.getElementById('showSelected');
+        
+        let zoom = 1;
+        let panX = 0;
+        let isDragging = false;
+        let lastX = 0;
+        
+        function resize() {
+            const rect = canvas.parentElement.getBoundingClientRect();
+            canvas.width = rect.width - 40;
+            canvas.height = 400;
+            draw();
+        }
+        
+        function draw() {
+            const w = canvas.width, h = canvas.height;
+            const padding = { top: 20, right: 20, bottom: 40, left: 50 };
+            const chartW = w - padding.left - padding.right;
+            const chartH = h - padding.top - padding.bottom;
+            
+            ctx.clearRect(0, 0, w, h);
+            
+            const totalPoints = data.length;
+            const visiblePoints = Math.ceil(totalPoints / zoom);
+            const startIdx = Math.max(0, Math.min(Math.floor(panX), totalPoints - visiblePoints));
+            const endIdx = Math.min(startIdx + visiblePoints, totalPoints);
+            const visibleData = data.slice(startIdx, endIdx);
+            
+            if (visibleData.length === 0) return;
+            
+            const minTime = visibleData[0].time;
+            const maxTime = visibleData[visibleData.length - 1].time;
+            const timeRange = maxTime - minTime || 1;
+            
+            ctx.strokeStyle = '#2a2a4a';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 5; i++) {
+                const y = padding.top + (chartH / 5) * i;
+                ctx.beginPath();
+                ctx.moveTo(padding.left, y);
+                ctx.lineTo(w - padding.right, y);
+                ctx.stroke();
+                
+                ctx.fillStyle = '#666';
+                ctx.font = '11px sans-serif';
+                ctx.textAlign = 'right';
+                ctx.fillText((100 - i * 20).toString(), padding.left - 10, y + 4);
+            }
+            
+            if (threshold !== null) {
+                const threshY = padding.top + chartH * (1 - threshold / 100);
+                ctx.strokeStyle = '#ff6b6b';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                ctx.moveTo(padding.left, threshY);
+                ctx.lineTo(w - padding.right, threshY);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+            
+            ctx.strokeStyle = '#00d4ff';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            visibleData.forEach((d, i) => {
+                const x = padding.left + ((d.time - minTime) / timeRange) * chartW;
+                const y = padding.top + chartH * (1 - d.sharpness / 100);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            
+            if (showSelectedCheckbox.checked) {
+                visibleData.filter(d => d.selected).forEach(d => {
+                    const x = padding.left + ((d.time - minTime) / timeRange) * chartW;
+                    const y = padding.top + chartH * (1 - d.sharpness / 100);
+                    
+                    ctx.fillStyle = 'rgba(0, 255, 136, 0.2)';
+                    ctx.fillRect(x - 1, padding.top, 2, chartH);
+                    
+                    ctx.fillStyle = '#00ff88';
+                    ctx.beginPath();
+                    ctx.arc(x, y, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+            }
+            
+            ctx.fillStyle = '#666';
+            ctx.font = '11px sans-serif';
+            ctx.textAlign = 'center';
+            const labelCount = Math.min(10, visibleData.length);
+            for (let i = 0; i < labelCount; i++) {
+                const idx = Math.floor(i * (visibleData.length - 1) / (labelCount - 1));
+                const d = visibleData[idx];
+                const x = padding.left + ((d.time - minTime) / timeRange) * chartW;
+                ctx.fillText(d.time.toFixed(1) + 's', x, h - 10);
+            }
+        }
+        
+        canvas.addEventListener('mousemove', (e) => {
+            if (isDragging) {
+                const dx = e.clientX - lastX;
+                panX -= dx * zoom / canvas.width * data.length / 5;
+                panX = Math.max(0, Math.min(panX, data.length - data.length / zoom));
+                lastX = e.clientX;
+                draw();
+                return;
+            }
+            
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const padding = { left: 50, right: 20 };
+            const chartW = canvas.width - padding.left - padding.right;
+            
+            const visiblePoints = Math.ceil(data.length / zoom);
+            const startIdx = Math.max(0, Math.min(Math.floor(panX), data.length - visiblePoints));
+            const visibleData = data.slice(startIdx, startIdx + visiblePoints);
+            
+            if (visibleData.length === 0) return;
+            
+            const minTime = visibleData[0].time;
+            const maxTime = visibleData[visibleData.length - 1].time;
+            const timeRange = maxTime - minTime || 1;
+            
+            const relX = (x - padding.left) / chartW;
+            const time = minTime + relX * timeRange;
+            
+            let closest = visibleData[0];
+            let minDist = Math.abs(visibleData[0].time - time);
+            visibleData.forEach(d => {
+                const dist = Math.abs(d.time - time);
+                if (dist < minDist) { minDist = dist; closest = d; }
+            });
+            
+            if (minDist < timeRange / 20) {
+                tooltip.style.display = 'block';
+                tooltip.style.left = (e.clientX - rect.left + 15) + 'px';
+                tooltip.style.top = (e.clientY - rect.top - 10) + 'px';
+                tooltip.innerHTML = '<strong>Frame ' + closest.frame + '</strong><br>Time: ' + closest.time.toFixed(3) + 's<br>Sharpness: ' + closest.sharpness.toFixed(1) + (closest.selected ? '<br><span style="color:#00ff88">Selected</span>' : '');
+            } else {
+                tooltip.style.display = 'none';
+            }
+        });
+        
+        canvas.addEventListener('mousedown', (e) => { isDragging = true; lastX = e.clientX; canvas.style.cursor = 'grabbing'; });
+        canvas.addEventListener('mouseup', () => { isDragging = false; canvas.style.cursor = 'crosshair'; });
+        canvas.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; isDragging = false; });
+        canvas.style.cursor = 'crosshair';
+        
+        zoomRange.addEventListener('input', () => {
+            zoom = parseFloat(zoomRange.value);
+            zoomInfo.textContent = Math.round(zoom * 100) + '%';
+            draw();
+        });
+        
+        showSelectedCheckbox.addEventListener('change', draw);
+        window.addEventListener('resize', resize);
+        resize();
+    </script>
+</body>
+</html>
