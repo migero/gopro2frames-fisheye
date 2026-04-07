@@ -5,10 +5,7 @@ Handles both fisheye and 360° equirectangular frame processing.
 
 import logging
 import os
-import sys
 
-# Import max2sphere modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'max2sphere'))
 import max2sphere as _max2sphere
 import max2fisheye as _max2fisheye
 

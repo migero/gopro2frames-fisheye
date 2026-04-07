@@ -5,7 +5,6 @@ from gfmhelper import GoProFrameMakerHelper, SharpnessAnalyzer
 from sensor_processing import parse_gpmf_gyro, integrate_gyro_roll
 from frame_rendering import _process_fisheye_frame, _process_360_frame, _process_360_frame_wrapper
 from exif_utils import ExiftoolGetMetadata, ExiftoolGetImagesMetadata, ExiftoolInjectMetadata, ExiftoolInjectImagesMetadata
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'max2sphere'))
 import max2sphere as _max2sphere      # For 360° equirectangular images
 import max2fisheye as _max2fisheye    # For fisheye images
 from geographiclib.geodesic import Geodesic

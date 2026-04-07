@@ -1,5 +1,5 @@
-import configparser, subprocess, threading, itertools, argparse, platform, logging, datetime, fnmatch, shutil, pandas as pd, shlex, html, copy, time, json, math, csv, os, re, sys
-from colorama import init, deinit, reinit, Fore, Back, Style
+import subprocess, argparse, time, os, sys
+from colorama import init, Fore, Style
 from gfmhelper import GoProFrameMakerHelper
 from gfmmain import GoProFrameMaker
 
