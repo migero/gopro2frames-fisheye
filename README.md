@@ -25,26 +25,36 @@ You can then install the required Trek View components:
 This repo:
 
 ```
-$ git clone https://github.com/trek-view/gopro-frame-maker
-$ cd gopro-frame-maker
-$ git clone https://github.com/trek-view/max2sphere
-$ cd max2sphere
-$ make -f Makefile
-$ cd ..
-$ git clone https://github.com/trek-view/fusion2sphere
-$ cd fusion2sphere
-$ make -f Makefile
-$ cd ..
+$ git clone https://github.com/migero/gopro2frames-fisheye
+$ cd gopro2frames-fisheye
 ```
 
-### Using a virtual environment
+**Note:** `max2sphere` and `fusion2sphere` have been merged into this project, so you no longer need to clone them separately.
 
-To keep things clean on your system, run it in a virtual environment:
+### Using a virtual environment (RECOMMENDED)
+
+**Important:** Use Python 3.9.23 specifically. Other Python versions may fail during dependency installation with errors like:
 
 ```
-$ python3 -m venv env
+ERROR: Failed to build 'pandas' when installing build dependencies for pandas
+```
+
+To keep things clean on your system and ensure compatibility, run it in a virtual environment:
+
+#### Using conda (recommended):
+
+```
+$ conda create -n gopro2frames python=3.9.23
+$ conda activate gopro2frames
+$ pip install -r requirements.txt
+```
+
+#### Using venv:
+
+```
+$ python3.9 -m venv env
 $ source env/bin/activate
-$ pip3 install -r requirements.txt
+$ pip install -r requirements.txt
 ```
 
 ## Usage
