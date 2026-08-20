@@ -673,9 +673,18 @@ class GoProFrameMaker(GoProFrameMakerParent):
 
             analyzer = SharpnessAnalyzer(crop_size=crop_size, ffmpeg_path=str(args['ffmpeg']))
             max_seconds = args.get('max_seconds')
+            startf = args.get('startf')
+            endf = args.get('endf')
 
-            # Analyze frames for sharpness
-            frame_data = analyzer.analyze_frames(filename, max_seconds=max_seconds)
+            # Analyze frames for sharpness within the requested frame range.
+            # When --startf/--endf are provided, analysis is restricted to that
+            # window instead of running across the whole video.
+            frame_data = analyzer.analyze_frames(
+                filename,
+                max_seconds=max_seconds,
+                start_frame=startf,
+                end_frame=endf,
+            )
 
             if not frame_data:
                 print("Warning: No frames could be analyzed, falling back to regular extraction")
@@ -722,14 +731,58 @@ class GoProFrameMaker(GoProFrameMakerParent):
             with open(frame_mapping_file, 'w') as f:
                 json.dump(frame_mapping, f, indent=2)
 
+            # Build optional -ss / -t pre-input seek args when --startf / --endf
+            # are provided. Without this, ffmpeg decodes the entire stream and
+            # evaluates the select filter on every frame, which hangs on .360.
+            seek_opts = []
+            seek_fps = 30.0
+            seek_duration = 0.0
+            try:
+                _probe = subprocess.run(
+                    ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+                     '-show_format', '-show_streams', filename],
+                    capture_output=True, text=True, timeout=10
+                )
+                _info = json.loads(_probe.stdout)
+                for _s in _info.get('streams', []):
+                    if _s.get('codec_type') == 'video':
+                        _r = _s.get('r_frame_rate', '30/1')
+                        _n, _d = _r.split('/')
+                        seek_fps = float(_n) / float(_d) if float(_d) else 30.0
+                        break
+                seek_duration = float(_info.get('format', {}).get('duration', 0))
+            except Exception:
+                pass
+
+            _startf = args.get('startf')
+            _endf = args.get('endf')
+            if _startf is not None and seek_fps > 0:
+                seek_opts += ['-ss', f"{max(0.0, (_startf - 1) / seek_fps):.6f}"]
+            if _endf is not None and seek_fps > 0:
+                _end_seconds = _endf / seek_fps
+                if seek_duration > 0:
+                    _end_seconds = min(_end_seconds, seek_duration)
+                if _startf is not None:
+                    _t = max(0.0, _end_seconds - max(0.0, (_startf - 1) / seek_fps))
+                else:
+                    _t = max(0.0, _end_seconds)
+                if _t > 0:
+                    seek_opts += ['-t', f"{_t:.6f}"]
+            if seek_opts:
+                print(f"  Extraction window: {_startf if _startf else 1}-{_endf if _endf else 'end'} "
+                      f"(seek {seek_opts})")
+
             # Extract selected frames
-            cmd = [
-                "-i", filename,
-                "-vf", f"select={select_expr}",
-                "-vsync", "0",
-                "-q:v", str(args["quality"]),
-                "{}{}{}%06d.jpg".format(fileoutput, os.sep, prefix)
-            ]
+            cmd = (
+                seek_opts
+                + [
+                    "-i", filename,
+                    "-vf", f"select={select_expr}",
+                    "-vsync", "0",
+                    "-q:v", str(args["quality"]),
+                    "{}{}{}%06d.jpg".format(fileoutput, os.sep, prefix),
+                ]
+            )
             output = self._ffmpeg(cmd, 1)
 
             # Rename extracted frames to match original frame numbers
@@ -869,12 +922,21 @@ class GoProFrameMaker(GoProFrameMakerParent):
                 print("\n" + "="*60)
                 print("SHARPNESS-BASED FRAME SELECTION ENABLED")
                 print("="*60)
-                
+
                 analyzer = SharpnessAnalyzer(crop_size=crop_size, ffmpeg_path=str(args['ffmpeg']))
                 max_seconds = args.get('max_seconds')
-                
-                # Analyze frames for sharpness
-                frame_data = analyzer.analyze_frames(filename, max_seconds=max_seconds)
+                startf = args.get('startf')
+                endf = args.get('endf')
+
+                # Analyze frames for sharpness within the requested frame range.
+                # When --startf/--endf are provided, analysis is restricted to that
+                # window instead of running across the whole video.
+                frame_data = analyzer.analyze_frames(
+                    filename,
+                    max_seconds=max_seconds,
+                    start_frame=startf,
+                    end_frame=endf,
+                )
                 
                 if not frame_data:
                     print("Warning: No frames could be analyzed, falling back to regular extraction")
@@ -932,26 +994,75 @@ class GoProFrameMaker(GoProFrameMakerParent):
                     with open(frame_mapping_file, 'r') as f:
                         frame_mapping = json.load(f)
                 
+                # Build optional -ss / -t pre-input seek args when the user supplied
+                # --startf / --endf. Without this, ffmpeg decodes the entire 6-minute
+                # HEVC stream evaluating the select filter on every frame, which
+                # hangs on .360 files. Restricting the decode window mirrors the
+                # seek we already do during sharpness analysis.
+                seek_opts = []
+                seek_fps = 30.0
+                seek_duration = 0.0
+                try:
+                    _probe = subprocess.run(
+                        ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+                         '-show_format', '-show_streams', filename],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    _info = json.loads(_probe.stdout)
+                    for _s in _info.get('streams', []):
+                        if _s.get('codec_type') == 'video':
+                            _r = _s.get('r_frame_rate', '30/1')
+                            _n, _d = _r.split('/')
+                            seek_fps = float(_n) / float(_d) if float(_d) else 30.0
+                            break
+                    seek_duration = float(_info.get('format', {}).get('duration', 0))
+                except Exception:
+                    pass
+
+                if startf is not None and seek_fps > 0:
+                    seek_opts += ['-ss', f"{max(0.0, (startf - 1) / seek_fps):.6f}"]
+                if endf is not None and seek_fps > 0:
+                    _end_seconds = endf / seek_fps
+                    if seek_duration > 0:
+                        _end_seconds = min(_end_seconds, seek_duration)
+                    # -t is relative to the seek point (-ss), so subtract it if both are used
+                    if startf is not None:
+                        _t = max(0.0, _end_seconds - max(0.0, (startf - 1) / seek_fps))
+                    else:
+                        _t = max(0.0, _end_seconds)
+                    if _t > 0:
+                        seek_opts += ['-t', f"{_t:.6f}"]
+
+                if seek_opts:
+                    print(f"  Extraction window: {startf if startf else 1}-{endf if endf else 'end'} "
+                          f"(seek {seek_opts})")
+
                 # Extract track0 (front camera)
-                cmd_track0 = [
-                    "-i", filename,
-                    "-map", trackmapFirst,
-                    "-vf", f"select={select_expr}",
-                    "-vsync", "0",
-                    "-q:v", str(args["quality"]),
-                    track0 + os.sep + "%06d.jpg"
-                ]
+                cmd_track0 = (
+                    seek_opts
+                    + [
+                        "-i", filename,
+                        "-map", trackmapFirst,
+                        "-vf", f"select={select_expr}",
+                        "-vsync", "0",
+                        "-q:v", str(args["quality"]),
+                        track0 + os.sep + "%06d.jpg",
+                    ]
+                )
                 output = self._ffmpeg(cmd_track0, 1)
-                
+
                 # Extract track5 (back camera)
-                cmd_track5 = [
-                    "-i", filename,
-                    "-map", trackmapSecond,
-                    "-vf", f"select={select_expr}",
-                    "-vsync", "0",
-                    "-q:v", str(args["quality"]),
-                    track5 + os.sep + "%06d.jpg"
-                ]
+                cmd_track5 = (
+                    seek_opts
+                    + [
+                        "-i", filename,
+                        "-map", trackmapSecond,
+                        "-vf", f"select={select_expr}",
+                        "-vsync", "0",
+                        "-q:v", str(args["quality"]),
+                        track5 + os.sep + "%06d.jpg",
+                    ]
+                )
                 output = self._ffmpeg(cmd_track5, 1)
                 
                 # Rename extracted frames to match original frame numbers

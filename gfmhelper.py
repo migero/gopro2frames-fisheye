@@ -15,7 +15,7 @@ class SharpnessAnalyzer:
     Analyzes video frames for sharpness using ffmpeg's blurdetect filter.
     Uses crop regions (small squares) to efficiently detect blur without processing entire frames.
     """
-    
+
     def __init__(self, crop_size: int = 256, ffmpeg_path: str = 'ffmpeg'):
         self.crop_size = crop_size
         self.ffmpeg_path = ffmpeg_path
@@ -25,7 +25,7 @@ class SharpnessAnalyzer:
         self.duration = 0
         self.frame_width = 0
         self.frame_height = 0
-    
+
     def get_video_info(self, video_path: str) -> dict:
         """Get video metadata using ffprobe"""
         cmd = [
@@ -36,7 +36,7 @@ class SharpnessAnalyzer:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         info = json.loads(result.stdout)
-        
+
         for stream in info.get('streams', []):
             if stream.get('codec_type') == 'video':
                 fps_str = stream.get('r_frame_rate', '30/1')
@@ -50,7 +50,7 @@ class SharpnessAnalyzer:
                     self.total_frames = int(duration * self.video_fps)
                 self.duration = float(info.get('format', {}).get('duration', 0))
                 break
-        
+
         return {
             'fps': self.video_fps,
             'total_frames': self.total_frames,
@@ -58,154 +58,205 @@ class SharpnessAnalyzer:
             'width': self.frame_width,
             'height': self.frame_height
         }
-    
+
     def get_crop_positions(self) -> list:
         """Calculate 5 crop positions: center + 4 at 50% distance to corners"""
         if not self.frame_width or not self.frame_height:
             return [(0, 0)]
-        
+
         w, h = self.frame_width, self.frame_height
         size = self.crop_size
-        
+
         # Center position
         center_x = (w - size) // 2
         center_y = (h - size) // 2
-        
+
         # 50% distance from center to each corner
         quarter_w = w // 4
         quarter_h = h // 4
-        
+
         positions = [
             (center_x, center_y),                    # Center
             (quarter_w, quarter_h),                  # Top-left region
-            (3 * quarter_w - size//2, quarter_h),   # Top-right region  
+            (3 * quarter_w - size//2, quarter_h),   # Top-right region
             (quarter_w, 3 * quarter_h - size//2),   # Bottom-left region
             (3 * quarter_w - size//2, 3 * quarter_h - size//2)  # Bottom-right region
         ]
-        
+
         # Ensure crops are within bounds
         valid_positions = []
         for x, y in positions:
             x = max(0, min(x, w - size))
             y = max(0, min(y, h - size))
             valid_positions.append((x, y))
-        
+
         return valid_positions
 
-    def analyze_frames(self, video_path: str, max_seconds: float = None) -> list:
+    def analyze_frames(self, video_path: str, max_seconds: float = None,
+                       start_frame: int = None, end_frame: int = None) -> list:
         """
-        Analyze all frames in video for sharpness using crop regions.
+        Analyze frames in video for sharpness using crop regions.
         Returns list of dicts with frame number, time, and sharpness score.
+
+        Args:
+            video_path: Path to the input video.
+            max_seconds: Optional cap on seconds of video to analyze (for testing).
+            start_frame: Optional 1-based starting frame number (matches --startf).
+                         When set, analysis begins at this frame.
+            end_frame: Optional 1-based ending frame number (matches --endf).
+                       When set, analysis stops at this frame (inclusive).
         """
         self.get_video_info(video_path)
         crops = self.get_crop_positions()
-        
+
         print(f"Analyzing video for sharpness ({len(crops)} crop regions, {self.crop_size}px squares)...")
         print(f"Video: {self.frame_width}x{self.frame_height}, {self.video_fps:.2f} fps, {self.duration:.1f}s")
-        
+
+        # Translate 1-based startf/endf into seconds for ffmpeg -ss/-t seeking.
+        # ffmpeg frame numbers are 0-based; --startf/--endf are 1-based.
+        start_seconds = None
+        end_seconds = None
+        if start_frame is not None and self.video_fps > 0:
+            start_seconds = max(0.0, (start_frame - 1) / self.video_fps)
+        if end_frame is not None and self.video_fps > 0:
+            end_seconds = (end_frame / self.video_fps)
+            # Clamp to actual video duration
+            if self.duration > 0:
+                end_seconds = min(end_seconds, self.duration)
+
+        if start_frame is not None or end_frame is not None:
+            range_desc = f"frames {start_frame if start_frame else 1}-{end_frame if end_frame else 'end'}"
+            print(f"  Restricting sharpness analysis to {range_desc}")
+
         self.frame_data = []
-        
+
         # Build filter for center crop (primary analysis)
         center_x, center_y = crops[0]
-        
-        # Build input options
-        input_opts = ['-i', video_path]
-        if max_seconds is not None:
-            input_opts = ['-t', str(max_seconds)] + input_opts
-        
+
+        # Build input options. -ss before -i enables fast input seek; -t caps duration.
+        input_opts = []
+        if start_seconds is not None:
+            input_opts += ['-ss', f"{start_seconds:.6f}"]
+        input_opts += ['-i', video_path]
+
+        # Determine duration limit: explicit --endf window takes priority over --max-seconds.
+        duration_cap = None
+        if start_seconds is not None and end_seconds is not None:
+            duration_cap = max(0.0, end_seconds - start_seconds)
+        elif start_seconds is not None and max_seconds is not None:
+            duration_cap = max(0.0, self.duration - start_seconds) if self.duration > 0 else max_seconds
+            duration_cap = min(duration_cap, max_seconds)
+        elif max_seconds is not None:
+            duration_cap = max_seconds
+        elif end_seconds is not None:
+            duration_cap = end_seconds
+
+        if duration_cap is not None and duration_cap > 0:
+            input_opts += ['-t', f"{duration_cap:.6f}"]
+
         # Use blurdetect filter for sharpness measurement
         crop_filter = f"crop={self.crop_size}:{self.crop_size}:{center_x}:{center_y},blurdetect,metadata=print"
-        
+
         # Use -map 0:v:0 to select the first video stream (important for .360 files with multiple video tracks)
         cmd = [self.ffmpeg_path] + input_opts + [
             '-map', '0:v:0',
             '-vf', crop_filter,
             '-f', 'null', '-'
         ]
-        
+
         # Run ffmpeg - metadata output goes to stderr
         process = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             text=True, bufsize=1
         )
-        
+
         # Parse blurdetect output
         blur_pattern = re.compile(r'lavfi\.blur=(\d+\.?\d*)')
         frame_pattern = re.compile(r'frame:(\d+)\s+pts:\d+\s+pts_time:(\d+\.?\d*)')
         current_frame = 0
         current_time = 0.0
-        
+
+        # When seeking with -ss, ffmpeg resets the frame counter to 0 from the
+        # seek point, but pts_time still reflects the decoded frame's timestamp.
+        # Compute the offset (in frames) so the reported frame index matches the
+        # original timeline used elsewhere in the codebase.
+        frame_offset = int(round(start_seconds * self.video_fps)) if start_seconds is not None and self.video_fps > 0 else 0
+
         for line in process.stderr:
             frame_match = frame_pattern.search(line)
             if frame_match:
                 current_frame = int(frame_match.group(1))
                 current_time = float(frame_match.group(2))
                 continue
-            
+
             blur_match = blur_pattern.search(line)
             if blur_match:
                 blur_value = float(blur_match.group(1))
                 # Convert blur (0-100+) to sharpness (100-0), clamped
                 sharpness = max(0, min(100, 100 - blur_value * 10))
-                
+
+                # Map the decoded frame index back to the original timeline so
+                # downstream extraction uses the real frame number.
+                original_frame = current_frame + frame_offset
+
                 self.frame_data.append({
-                    'frame': current_frame,
+                    'frame': original_frame,
                     'time': current_time,
                     'blur': blur_value,
                     'sharpness': sharpness
                 })
-                
+
                 # Progress indicator every 500 frames
                 if len(self.frame_data) % 500 == 0:
                     print(f"  Analyzed {len(self.frame_data)} frames...")
-        
+
         process.wait()
-        
+
         print(f"  Analysis complete: {len(self.frame_data)} frames analyzed")
-        
+
         if self.frame_data:
             avg_sharpness = sum(f['sharpness'] for f in self.frame_data) / len(self.frame_data)
             min_sharpness = min(f['sharpness'] for f in self.frame_data)
             max_sharpness = max(f['sharpness'] for f in self.frame_data)
             print(f"  Sharpness stats: avg={avg_sharpness:.1f}, min={min_sharpness:.1f}, max={max_sharpness:.1f}")
-        
+
         return self.frame_data
-    
+
     def select_best_frames(self, target_fps: float, threshold: float = None) -> list:
         """
         Select the best (sharpest) frame from each interval based on target FPS.
         Args:
             target_fps: Desired output frame rate
             threshold: Minimum sharpness score (0-100). Frames below this are skipped.
-        
+
         Returns:
             List of selected frame dicts with interval info
         """
         if not self.frame_data or self.video_fps <= 0:
             return []
-        
+
         # Calculate interval size (how many source frames per output frame)
         interval = int(self.video_fps / target_fps)
         if interval < 1:
             interval = 1
-        
+
         selected = []
         skipped_count = 0
         num_intervals = (len(self.frame_data) + interval - 1) // interval
-        
+
         for i in range(num_intervals):
             start_idx = i * interval
             end_idx = min(start_idx + interval, len(self.frame_data))
-            
+
             interval_frames = self.frame_data[start_idx:end_idx]
             if interval_frames:
                 best = max(interval_frames, key=lambda x: x['sharpness'])
-                
+
                 # Apply threshold filter
                 if threshold is not None and best['sharpness'] < threshold:
                     skipped_count += 1
                     continue
-                
+
                 selected.append({
                     'interval': i,
                     'frame': best['frame'],
@@ -213,14 +264,14 @@ class SharpnessAnalyzer:
                     'sharpness': best['sharpness'],
                     'blur': best['blur']
                 })
-        
+
         if skipped_count > 0:
             print(f"  Skipped {skipped_count} intervals due to sharpness below threshold ({threshold})")
-        
+
         print(f"  Selected {len(selected)} frames from {num_intervals} intervals")
-        
+
         return selected
-    
+
     def get_frame_numbers_for_extraction(self, target_fps: float, threshold: float = None) -> list:
         """
         Get 1-based frame numbers suitable for extraction.
@@ -229,8 +280,8 @@ class SharpnessAnalyzer:
         selected = self.select_best_frames(target_fps, threshold)
         # Convert 0-based frame indices to 1-based frame numbers
         return [f['frame'] + 1 for f in selected]
-    
-    def generate_sharpness_chart(self, output_path: str, selected_frames: list = None, 
+
+    def generate_sharpness_chart(self, output_path: str, selected_frames: list = None,
                                   threshold: float = None, video_name: str = "Video"):
         """
         Generate a standalone HTML file with an interactive sharpness chart.
@@ -239,20 +290,20 @@ class SharpnessAnalyzer:
         if not self.frame_data:
             print("No frame data to generate chart")
             return
-        
+
         # Prepare data for the chart
         sharpness_values = [f['sharpness'] for f in self.frame_data]
-        
+
         # Selected frame indices (if provided)
         selected_indices = set()
         if selected_frames:
             selected_indices = {f['frame'] for f in selected_frames}
-        
+
         # Statistics
         avg_sharpness = sum(sharpness_values) / len(sharpness_values)
         min_sharpness = min(sharpness_values)
         max_sharpness = max(sharpness_values)
-        
+
         # Convert data to JSON for JavaScript
         chart_data = json.dumps([{
             'frame': f['frame'],
@@ -260,15 +311,15 @@ class SharpnessAnalyzer:
             'sharpness': round(f['sharpness'], 2),
             'selected': f['frame'] in selected_indices
         } for f in self.frame_data])
-        
+
         threshold_js = threshold if threshold is not None else 'null'
         threshold_legend = '<div class="legend-item"><div class="legend-color" style="background: #ff6b6b;"></div><span>Threshold</span></div>' if threshold else ''
-        
+
         # Load HTML template
         template_path = os.path.join(os.path.dirname(__file__), 'templates', 'sharpness_chart.html')
         with open(template_path, 'r') as f:
             html_content = f.read()
-        
+
         # Replace template variables; avoid .format() to keep braces in CSS/JS literal
         replacements = {
             'video_name': video_name,
@@ -290,7 +341,7 @@ class SharpnessAnalyzer:
 
         with open(output_path, 'w') as f:
             f.write(html_content)
-        
+
         print(f"  Sharpness chart saved to: {output_path}")
 
 
