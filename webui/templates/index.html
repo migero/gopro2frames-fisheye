@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sphere Tracker Viewer (Grid)</title>
+<style>
+  :root { --bg:#0e1117; --panel:#161b22; --fg:#e6edf3; --accent:#3fb950; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+              font-family:system-ui, sans-serif; overflow:hidden; }
+  #topbar { position:fixed; top:0; left:0; right:0; height:52px; z-index:20;
+            background:#0b0d12; border-bottom:1px solid #21262d;
+            display:flex; align-items:center; gap:14px; padding:0 16px; }
+  #topbar h1 { font-size:14px; margin:0; font-weight:600; }
+  #status { font-size:12px; color:#8b949e; }
+  .spacer { flex:1; }
+  .btn { background:#21262d; border:1px solid #30363d; color:var(--fg);
+         padding:5px 12px; border-radius:6px; cursor:pointer; font-size:13px; }
+  .btn:hover { background:#30363d; }
+  .btn.on { background:var(--accent); color:#0b0d12; border-color:var(--accent); }
+  #wrap { position:fixed; top:52px; left:0; right:0; bottom:64px; }
+  #canvas { width:100%; height:100%; display:block; }
+  #hint { position:absolute; top:10px; left:12px; color:#8b949e; font-size:12px;
+          background:rgba(0,0,0,.5); padding:4px 8px; border-radius:4px; }
+  #timeline-wrap { position:fixed; left:0; right:0; bottom:0; height:64px;
+                   background:#0b0d12; border-top:1px solid #21262d; z-index:20;
+                   display:flex; align-items:center; gap:12px; padding:0 16px; }
+  #scrub { flex:1; -webkit-appearance:none; height:6px; border-radius:3px;
+           background:#30363d; outline:none; }
+  #scrub::-webkit-slider-thumb { -webkit-appearance:none; width:18px; height:18px;
+    border-radius:50%; background:var(--accent); cursor:pointer; }
+  #frameinfo { font-size:13px; font-variant-numeric:tabular-nums; min-width:130px; }
+  #legend { position:fixed; right:12px; bottom:72px; font-size:12px; color:#8b949e;
+            background:rgba(0,0,0,.55); padding:8px 10px; border-radius:6px;
+            display:flex; flex-direction:column; gap:4px; max-width:220px; }
+  .chip { display:flex; align-items:center; gap:6px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <h1>Sphere Tracker Viewer</h1>
+  <span id="status">loading…</span>
+  <div class="spacer"></div>
+  <button class="btn on" id="btn-leveled">Leveled</button>
+  <button class="btn on" id="btn-play">Pause</button>
+</div>
+<div id="wrap"><canvas id="canvas"></canvas>
+  <div id="hint">360 equirect map · green = gravity horizon · blue = side cameras · yellow = downward camera · filled = YOLO people · L = toggle Leveled/Raw</div>
+</div>
+<div id="legend"></div>
+<div id="timeline-wrap">
+  <span id="frameinfo">– / –</span>
+  <input type="range" id="scrub" min="0" max="0" value="0">
+</div>
+<script>
+(function(){
+"use strict";
+const cv = document.getElementById('canvas');
+const ctx = cv.getContext('2d');
+let INFO={}, COLOR={}, LIVE=false, RECS=[], current=0, playing=true;
+let VIEWS=[], FOV=90;
+
+const colorFor=id=>{ if(!(id+'') in COLOR){ const hue=(id*137.508)%360; COLOR[id]=`hsl(${hue},80%,60%)`; } return COLOR[id]; };
+
+function cross(a,b){ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function norm(v){ const n=Math.hypot(v[0],v[1],v[2])||1; return [v[0]/n,v[1]/n,v[2]/n]; }
+// world dir from bearing/elev (convention: az=atan2(x,z), el=asin(y))
+function dirFromAzEl(az_deg,el_deg){
+  const a=az_deg*Math.PI/180, e=el_deg*Math.PI/180;
+  return [Math.cos(e)*Math.sin(a), Math.sin(e), Math.cos(e)*Math.cos(a)];
+}
+function matvec(M,v){ return [M[0][0]*v[0]+M[0][1]*v[1]+M[0][2]*v[2], M[1][0]*v[0]+M[1][1]*v[1]+M[1][2]*v[2], M[2][0]*v[0]+M[2][1]*v[1]+M[2][2]*v[2]]; }
+function trans(M){ return [[M[0][0],M[1][0],M[2][0]],[M[0][1],M[1][1],M[2][1]],[M[0][2],M[1][2],M[2][2]]]; }
+// world (gyro) direction -> equirect sensor frame dir; no pose => identity
+let POSE=null;
+function worldToImg(w){ return POSE? matvec(trans(POSE),w): w; }
+
+// map-leveling: re-orient the whole map so gravity-up is screen-up. A single
+// per-frame rotation RLV (sensor gravity g -> [0,1,0]) is applied to every
+// sensor-frame position (horizon, boxes, AND people) so they stay consistent.
+// Toggle 'leveled': true = gyro-leveled (flat horizon), false = raw camera tilt.
+let leveled=true, RLV=null;
+function matmat(A,B){ const C=[[0,0,0],[0,0,0],[0,0,0]];
+  for(let i=0;i<3;i++)for(let j=0;j<3;j++)C[i][j]=A[i][0]*B[0][j]+A[i][1]*B[1][j]+A[i][2]*B[2][j];
+  return C; }
+function rotFromTo(a,b){ // smallest rotation mapping unit a->b
+  a=norm(a);b=norm(b);
+  const c=Math.acos(Math.max(-1,Math.min(1,a[0]*b[0]+a[1]*b[1]+a[2]*b[2])));
+  if(Math.abs(c)<1e-9) return [[1,0,0],[0,1,0],[0,0,1]];
+  const ax=norm(cross(a,b)); const s=Math.sin(c),co=Math.cos(c),x=ax[0],y=ax[1],z=ax[2];
+  return [[co+x*x*(1-co),x*y*(1-co)-z*s,x*z*(1-co)+y*s],
+          [y*x*(1-co)+z*s,co+y*y*(1-co),y*z*(1-co)-x*s],
+          [z*x*(1-co)-y*s,z*y*(1-co)+x*s,co+z*z*(1-co)]]; }
+function updLevel(){ // recompute RLV from current pose; offline => identity
+  if(!POSE) RLV=null;
+  else{ const g=matvec(trans(POSE),[0,1,0]); RLV=rotFromTo(g,[0,1,0]); }
+}
+function sensorDir(lon_deg,lat_deg){ const a=lon_deg*Math.PI/180,e=lat_deg*Math.PI/180;
+  return [Math.cos(e)*Math.sin(a), Math.sin(e), Math.cos(e)*Math.cos(a)]; }
+function mapDir(v){ return (leveled&&RLV)? matvec(RLV,v): v; }
+// sensor-frame [lon,lat] -> map-frame [lon,lat] (applies leveling to people/boxes)
+function mapLonLat(lon,lat){
+  if(!(leveled&&RLV)) return [lon,lat];
+  return dirToLonLat(mapDir(sensorDir(lon,lat)));
+}
+function dirToLonLat(d){ return [Math.atan2(d[0],d[2])*180/Math.PI, Math.asin(Math.max(-1,Math.min(1,d[1])))*180/Math.PI]; }
+
+// equirect layout: width fills the canvas, height = width/2 centered vertically
+let mapW=0, mapH=0, offY=0;
+function layout(W,H){ mapW=W; mapH=W/2; offY=(H-mapH)/2; }
+function eqXY(lon,lat){ return {x:(lon/180+1)/2*mapW, y:offY+(1-lat/90)/2*mapH}; }
+
+function draw(){
+  const W=cv.clientWidth, H=cv.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  layout(W,H);
+
+  // equirect graticule in the image frame: vertical lon lines, horizontal lat lines
+  ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.lineWidth=1;
+  for(let lon=-150; lon<=150; lon+=30){
+    const x=(lon/180+1)/2*mapW;
+    ctx.beginPath(); ctx.moveTo(x,offY); ctx.lineTo(x,offY+mapH); ctx.stroke();
+  }
+  for(let lat=-80; lat<=80; lat+=20){
+    const y=offY+(1-lat/90)/2*mapH;
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(mapW,y); ctx.stroke();
+  }
+  ctx.strokeStyle='rgba(255,255,255,0.18)';
+  ctx.beginPath(); ctx.rect(0,offY,mapW,mapH); ctx.stroke();
+
+  // gravity horizon (world elev 0) mapped through gyro pose -> eq curve
+  ctx.strokeStyle='rgba(63,185,80,0.75)'; ctx.lineWidth=2; ctx.beginPath();
+  for(let a=-180; a<=180; a+=3){
+    const w=mapDir(worldToImg([Math.cos(a*Math.PI/180),0,Math.sin(a*Math.PI/180)]));
+    const ll=dirToLonLat(w), p=eqXY(ll[0],ll[1]);
+    if(a===-180) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y);
+  }
+  ctx.stroke();
+
+  // perspective camera field-of-view borders
+  drawViewCams();
+
+  // people: YOLO mask polygons (sensor-frame lon/lat, level-mapped) or centroid
+  for(const rec of RECS){
+    const c=colorFor(rec.person_id);
+    if(rec.poly_lonlat && rec.poly_lonlat.length>=3){
+      const ll=rec.poly_lonlat.map(v=>mapLonLat(v[0],v[1]));
+      drawPoly(ll, c, 0.22);
+    } else {
+      const lon=rec.lon_deg!==undefined?rec.lon_deg:0;
+      const lat=rec.lat_deg!==undefined?rec.lat_deg:0;
+      const m=mapLonLat(lon,lat);
+      const p=eqXY(m[0],m[1]);
+      const rpix=Math.max(3,(rec.angular_height_deg||5)/180*mapW*0.5);
+      ctx.strokeStyle=c; ctx.fillStyle=c; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(p.x,p.y,rpix,0,Math.PI*2); ctx.stroke();
+      ctx.fillStyle=c; ctx.beginPath(); ctx.arc(p.x,p.y,2.5,0,Math.PI*2); ctx.fill();
+    }
+    const lon=rec.lon_deg!==undefined?rec.lon_deg:0;
+    const lat=rec.lat_deg!==undefined?rec.lat_deg:0;
+    const m=mapLonLat(lon,lat);
+    const p=eqXY(m[0],m[1]);
+    ctx.fillStyle=c; ctx.font='10px system-ui'; ctx.textAlign='center';
+    ctx.fillText('#'+rec.person_id, p.x, p.y-4);
+  }
+}
+
+// Seam-aware renderer for a closed shape given as [lon,lat] points. Longitude is
+// unwrapped to make the shape continuous, then the polygon is drawn into each
+// 360deg window copy it touches, confined with a canvas clip. Canvas fill/stroke
+// handle non-convex shapes natively, and each seam-crossing closure follows the
+// shape's own boundary, so a wrapped FOV/person/nadir is split cleanly into its
+// side pieces with no stray line drawn across the map.
+function drawPoly(lonlats, color, fillA){
+  if(!lonlats || lonlats.length<3) return;
+  // unwrap lon: keep consecutive longitudes within +-180 of the previous
+  const lon=lonlats.map(ll=>ll[0]);
+  const unwrap=[lon[0]];
+  for(let i=1;i<lon.length;i++){
+    let d=lon[i]-unwrap[i-1];
+    while(d>180) d-=360; while(d<-180) d+=360;
+    unwrap.push(unwrap[i-1]+d);
+  }
+  const X=unwrap.map(lo=>(lo/180+1)/2*mapW);
+  const Y=lonlats.map(ll=>offY+(1-ll[1]/90)/2*mapH);
+  const xmin=Math.min(...X), xmax=Math.max(...X);
+  // integer window indices the polygon touches (each window = [k*mapW, (k+1)*mapW])
+  const kmin=Math.floor(xmin/mapW)-1, kmax=Math.ceil(xmax/mapW)+1;
+  if(kmax-kmin>6) return; // safety: avoid pathological huge polygons
+  const top=offY, bot=offY+mapH;
+  for(let k=kmin;k<=kmax;k++){
+    const sh=-k*mapW;
+    ctx.save();
+    // clip to this window's band (small overlap so seam pieces meet without gaps)
+    ctx.beginPath();
+    ctx.rect(-1, top-1, mapW+2, (bot-top)+2);
+    ctx.clip();
+    ctx.beginPath();
+    for(let i=0;i<X.length;i++){
+      if(i===0) ctx.moveTo(X[i]+sh,Y[i]); else ctx.lineTo(X[i]+sh,Y[i]);
+    }
+    ctx.closePath();
+    ctx.strokeStyle=color; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle=color; ctx.globalAlpha=fillA; ctx.fill(); ctx.globalAlpha=1;
+    ctx.restore();
+  }
+}
+
+// Draw each perspective camera's FOV as the projected border of its square
+// frustum (bent by the map), using the world->image pose for leveling.
+const _SIGN_PERIM = (function(){
+  const N=24, out=[];
+  for(let s=0;s<N;s++) out.push([-1+2*s/(N-1), 1]);        // top
+  for(let s=1;s<N;s++) out.push([1, 1-2*s/(N-1)]);         // right
+  for(let s=1;s<N;s++) out.push([1-2*s/(N-1), -1]);        // bottom
+  for(let s=1;s<N-1;s++) out.push([-1, -1+2*s/(N-1)]);     // left
+  return out;
+})();
+function drawViewCams(){
+  if(VIEWS.length===0) return;
+  const tHF=Math.tan(FOV*Math.PI/360);          // tan(fov/2)
+  for(let vi=0; vi<VIEWS.length; vi++){
+    const v=VIEWS[vi];
+    if(v.nadir){
+      // Down view: draw the "region below the camera" as ONE solid full-width
+      // band that always reaches the bottom corners (never splits). Its top
+      // boundary is the cone's upper rim, gyro-aligned: flat in leveled mode,
+      // tilts/moves with the gyro in raw mode.
+      const rimEl=v.el_deg + FOV/2;       // world-frame rim elevation
+      const lonlats=[];
+      const NP=48;
+      for(let s=0;s<=NP;s++){
+        const az=-180+360*s/NP;
+        const wd=dirFromAzEl(az, rimEl);
+        lonlats.push(dirToLonLat(mapDir(worldToImg(wd))));
+      }
+      lonlats.push([180, -90]);           // bottom-right corner (map bottom)
+      lonlats.push([-180, -90]);          // bottom-left corner
+      drawPoly(lonlats, 'rgba(255,200,40,0.75)', 0.20);
+      continue;
+    }
+    const F=dirFromAzEl(v.az_deg, v.el_deg);
+    const Uref = Math.abs(F[1]) > 0.9 ? [0,0,1] : [0,1,0];
+    const R=norm(cross(F,Uref));
+    const Up=cross(R,F);
+    const lonlats=[];
+    for(const s of _SIGN_PERIM){
+      const cam=[s[0]*tHF, s[1]*tHF, 1];
+      const cn=Math.hypot(cam[0],cam[1],cam[2]);
+      const wd=[
+        R[0]*cam[0]/cn+Up[0]*cam[1]/cn+F[0]*cam[2]/cn,
+        R[1]*cam[0]/cn+Up[1]*cam[1]/cn+F[1]*cam[2]/cn,
+        R[2]*cam[0]/cn+Up[2]*cam[1]/cn+F[2]*cam[2]/cn];
+      const wi=mapDir(worldToImg(wd));
+      lonlats.push(dirToLonLat(wi));
+    }
+    drawPoly(lonlats, 'rgba(80,200,255,0.5)', 0.06);
+  }
+}
+
+// ---------- data ----------
+async function pollLatest(){  const res=await (await fetch('/latest')).json();
+  RECS=res.records||[]; current=res.frame_index||0;
+  liveHead=current;
+  if(res.pose) POSE=res.pose;
+  updLevel();
+  updateInfo();
+  draw();
+}
+async function seekFrame(i){
+  const res=await (await fetch('/tracks?frame='+i)).json();
+  RECS=res.records||[]; current=res.frame_index||i;
+  if(res.pose) POSE=res.pose;
+  updLevel();
+  updateInfo(); draw();
+}
+async function fetchTracks(){
+  const res=await (await fetch('/tracks')).json();
+  return res;
+}
+
+const scrub=document.getElementById('scrub');
+const frameinfo=document.getElementById('frameinfo');
+const status=document.getElementById('status');
+let liveHead=0, followingLive=true, scrubbing=false;
+
+function updateInfo(){
+  const m=INFO.live_meta||{};
+  if(INFO.live){
+    if(followingLive){
+      status.textContent=`LIVE · frame ${current} · ${INFO.tracks} records · ${(m.fps||0).toFixed(1)} fp`;
+      frameinfo.textContent=`frame ${current} · ${(current/INFO.fps).toFixed(1)}s`;
+    } else {
+      status.textContent=`SCRUB · frame ${current} (${current==liveHead?'== live':(liveHead-current)+' behind live'}) · drag to end or ⏵Live`;
+      frameinfo.textContent=`frame ${current} · ${(current/INFO.fps).toFixed(1)}s · head ${liveHead}`;
+    }
+  }
+}
+
+async function setFrame(i, perFrame){
+  if(perFrame) {
+    current=i;
+    RECS=(perFrame[current]||[]);
+    updateInfo(); draw();
+  }
+}
+
+function buildLegend(perFrame){
+  const ids={};
+  for(const k in perFrame) for(const r of perFrame[k]) ids[r.person_id]=1;
+  const leg=document.getElementById('legend');
+  leg.innerHTML='';
+  for(const id of Object.keys(ids)){
+    const d=document.createElement('div'); d.className='chip';
+    d.innerHTML=`<span class="dot" style="background:${colorFor(+id)}"></span>person #${id}`;
+    leg.appendChild(d);
+  }
+}
+
+const seenIds={};
+function buildLiveLegend(){
+  for(const r of RECS) seenIds[r.person_id]=1;
+  const leg=document.getElementById('legend');
+  leg.innerHTML='';
+  for(const id of Object.keys(seenIds)){
+    const d=document.createElement('div'); d.className='chip';
+    d.innerHTML=`<span class="dot" style="background:${colorFor(+id)}"></span>person #${id}`;
+    leg.appendChild(d);
+  }
+}
+
+async function init(){
+  let info=await (await fetch('/info')).json();
+  INFO=info; LIVE=!!info.live;
+  try{ const v=await (await fetch('/views')).json(); VIEWS=v.views||[]; FOV=v.fov||90; }catch(e){}
+  // timeline is always visible now (live or offline); follows live by default
+  document.getElementById('timeline-wrap').style.display='';
+  scrub.max=0;
+  const btnPlay=document.getElementById('btn-play');
+  btnPlay.style.display= LIVE? 'none' : '';
+
+  const btnLeveled=document.getElementById('btn-leveled');
+  const setLeveled=lvl=>{ leveled=lvl; btnLeveled.textContent=leveled?'Leveled':'Raw';
+    btnLeveled.classList.toggle('on',leveled); draw(); };
+  btnLeveled.addEventListener('click',()=>setLeveled(!leveled));
+  window.addEventListener('keydown',e=>{ if(e.key==='L'||e.key==='l') setLeveled(!leveled); });
+
+  if(!LIVE){
+    const perFrame=await fetchTracks();
+    buildLegend(perFrame);
+    const frames=info.track_frames||[];
+    scrub.max=Math.max(0,frames.length?frames.length-1:0);
+    function idxToFrame(i){ return frames[Math.min(i,frames.length-1)]; }
+    const show=async i=>{
+      current=idxToFrame(i);
+      RECS=perFrame[current]||[];
+      status.textContent=`${info.tracks} records · frames ${frames.length} · fps ${info.fps}`;
+      frameinfo.textContent=`${current} · ${(current/info.fps).toFixed(1)}s`;
+      draw();
+    };
+    if(frames.length) show(0);
+    scrub.addEventListener('input', ()=>{ playing=false; btnPlay.classList.toggle('on',playing); btnPlay.textContent=playing?'Pause':'Play'; show(+scrub.value); });
+    btnPlay.addEventListener('click',()=>{
+      playing=!playing; btnPlay.classList.toggle('on',playing);
+      btnPlay.textContent=playing?'Pause':'Play';
+      if(playing) advance();
+    });
+    async function advance(){
+      if(!playing) return;
+      let i=parseInt(scrub.value,10);
+      i=(i+1)%(scrub.max+1); scrub.value=i; await show(i);
+      setTimeout(advance, 1000/info.fps);
+    }
+  } else {
+    // LIVE: scrubbable timeline that auto-follows the live head, pauses while
+    // dragging, and snaps back to live when dragged to the far right.
+    const getHead=()=>liveHead;
+    async function setScrubMax(){
+      const ifo=await (await fetch('/info')).json();
+      const frames=ifo.track_frames||[];
+      if(frames.length){ scrub.max=Math.min(ifo.max_frame, frames[frames.length-1]); }
+    }
+    const showScrubbed=async i=>{ await seekFrame(i); };
+
+    // slider input: pause live-follow and show the selected frame
+    scrub.addEventListener('input',()=>{
+      const i=parseInt(scrub.value,10);
+      followingLive=false;
+      showScrubbed(i);
+    });
+
+    // dragging to the far right -> resume live
+    scrub.addEventListener('change',()=>{
+      if(parseInt(scrub.value,10)>=liveHead){ followingLive=true; }
+    });
+
+    // periodic tick: extend slider + follow live head unless scrubbing
+    setScrubMax();
+    await pollLatest();
+    buildLiveLegend();
+    setInterval(async ()=>{
+      await setScrubMax();
+      if(followingLive){
+        scrub.value=liveHead;
+        await pollLatest();
+        buildLiveLegend();
+      }
+    }, 500);
+  }
+  status.textContent=(status.textContent||'')+` · ${info.width}x${info.height}`;
+  resize();
+}
+
+function resize(){
+  const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
+  cv.width=w*dpr; cv.height=h*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  draw();
+}
+window.addEventListener('resize', resize);
+
+init();
+})();
+</script>
+</body>
+</html>

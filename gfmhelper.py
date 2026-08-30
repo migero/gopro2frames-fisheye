@@ -95,32 +95,25 @@ class SharpnessAnalyzer:
     def analyze_frames(self, video_path: str, max_seconds: float = None,
                        start_frame: int = None, end_frame: int = None) -> list:
         """
-        Analyze frames in video for sharpness using crop regions.
-        Returns list of dicts with frame number, time, and sharpness score.
+        Analyze frames for sharpness using ffmpeg's blurdetect filter.
 
-        Args:
-            video_path: Path to the input video.
-            max_seconds: Optional cap on seconds of video to analyze (for testing).
-            start_frame: Optional 1-based starting frame number (matches --startf).
-                         When set, analysis begins at this frame.
-            end_frame: Optional 1-based ending frame number (matches --endf).
-                       When set, analysis stops at this frame (inclusive).
+        For GoPro .360 files both video streams are analyzed: 0:v:0 and 0:4.
+        The blur values are NOT summed. For each frame the maximum blur from
+        the two streams is used for the final sharpness score.
         """
         self.get_video_info(video_path)
         crops = self.get_crop_positions()
 
         print(f"Analyzing video for sharpness ({len(crops)} crop regions, {self.crop_size}px squares)...")
         print(f"Video: {self.frame_width}x{self.frame_height}, {self.video_fps:.2f} fps, {self.duration:.1f}s")
+        print("  Checking video streams 0:v:0 and 0:4; using MAX blur per frame.")
 
-        # Translate 1-based startf/endf into seconds for ffmpeg -ss/-t seeking.
-        # ffmpeg frame numbers are 0-based; --startf/--endf are 1-based.
         start_seconds = None
         end_seconds = None
         if start_frame is not None and self.video_fps > 0:
             start_seconds = max(0.0, (start_frame - 1) / self.video_fps)
         if end_frame is not None and self.video_fps > 0:
-            end_seconds = (end_frame / self.video_fps)
-            # Clamp to actual video duration
+            end_seconds = end_frame / self.video_fps
             if self.duration > 0:
                 end_seconds = min(end_seconds, self.duration)
 
@@ -129,17 +122,8 @@ class SharpnessAnalyzer:
             print(f"  Restricting sharpness analysis to {range_desc}")
 
         self.frame_data = []
-
-        # Build filter for center crop (primary analysis)
         center_x, center_y = crops[0]
 
-        # Build input options. -ss before -i enables fast input seek; -t caps duration.
-        input_opts = []
-        if start_seconds is not None:
-            input_opts += ['-ss', f"{start_seconds:.6f}"]
-        input_opts += ['-i', video_path]
-
-        # Determine duration limit: explicit --endf window takes priority over --max-seconds.
         duration_cap = None
         if start_seconds is not None and end_seconds is not None:
             duration_cap = max(0.0, end_seconds - start_seconds)
@@ -151,74 +135,98 @@ class SharpnessAnalyzer:
         elif end_seconds is not None:
             duration_cap = end_seconds
 
-        if duration_cap is not None and duration_cap > 0:
-            input_opts += ['-t', f"{duration_cap:.6f}"]
+        def run_blurdetect(stream_map: str, stream_name: str) -> dict:
+            """Run blurdetect on one stream and return frame -> blur/time."""
+            input_opts = []
+            if start_seconds is not None:
+                input_opts += ['-ss', f"{start_seconds:.6f}"]
+            input_opts += ['-i', video_path]
+            if duration_cap is not None and duration_cap > 0:
+                input_opts += ['-t', f"{duration_cap:.6f}"]
 
-        # Use blurdetect filter for sharpness measurement
-        crop_filter = f"crop={self.crop_size}:{self.crop_size}:{center_x}:{center_y},blurdetect,metadata=print"
+            crop_filter = (
+                f"crop={self.crop_size}:{self.crop_size}:{center_x}:{center_y},"
+                "blurdetect,metadata=print"
+            )
+            cmd = [self.ffmpeg_path] + input_opts + [
+                '-map', stream_map,
+                '-vf', crop_filter,
+                '-f', 'null', '-'
+            ]
 
-        # Use -map 0:v:0 to select the first video stream (important for .360 files with multiple video tracks)
-        cmd = [self.ffmpeg_path] + input_opts + [
-            '-map', '0:v:0',
-            '-vf', crop_filter,
-            '-f', 'null', '-'
-        ]
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True, bufsize=1
+            )
 
-        # Run ffmpeg - metadata output goes to stderr
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, bufsize=1
-        )
+            blur_pattern = re.compile(r'lavfi\.blur=(\d+\.?\d*)')
+            frame_pattern = re.compile(r'frame:(\d+)\s+pts:\d+\s+pts_time:(\d+\.?\d*)')
+            current_frame = 0
+            current_time = 0.0
+            stream_data = {}
 
-        # Parse blurdetect output
-        blur_pattern = re.compile(r'lavfi\.blur=(\d+\.?\d*)')
-        frame_pattern = re.compile(r'frame:(\d+)\s+pts:\d+\s+pts_time:(\d+\.?\d*)')
-        current_frame = 0
-        current_time = 0.0
+            frame_offset = (
+                int(round(start_seconds * self.video_fps))
+                if start_seconds is not None and self.video_fps > 0 else 0
+            )
 
-        # When seeking with -ss, ffmpeg resets the frame counter to 0 from the
-        # seek point, but pts_time still reflects the decoded frame's timestamp.
-        # Compute the offset (in frames) so the reported frame index matches the
-        # original timeline used elsewhere in the codebase.
-        frame_offset = int(round(start_seconds * self.video_fps)) if start_seconds is not None and self.video_fps > 0 else 0
+            for line in process.stderr:
+                frame_match = frame_pattern.search(line)
+                if frame_match:
+                    current_frame = int(frame_match.group(1))
+                    current_time = float(frame_match.group(2))
+                    continue
 
-        for line in process.stderr:
-            frame_match = frame_pattern.search(line)
-            if frame_match:
-                current_frame = int(frame_match.group(1))
-                current_time = float(frame_match.group(2))
+                blur_match = blur_pattern.search(line)
+                if blur_match:
+                    blur_value = float(blur_match.group(1))
+                    original_frame = current_frame + frame_offset
+                    stream_data[original_frame] = {
+                        'blur': blur_value,
+                        'time': current_time
+                    }
+
+            process.wait()
+            print(f"  Stream {stream_name}: {len(stream_data)} frames analyzed")
+            if process.returncode != 0:
+                print(f"  Warning: ffmpeg returned {process.returncode} for stream {stream_name}")
+            return stream_data
+
+        # Analyze both GoPro video streams independently.
+        primary_data = run_blurdetect('0:v:0', '0:v:0')
+        secondary_data = run_blurdetect('0:4', '0:4')
+
+        # Merge by source frame. NEVER add the blur values.
+        # If either stream is blurrier, that maximum becomes the frame blur.
+        all_frames = sorted(set(primary_data) | set(secondary_data))
+        for original_frame in all_frames:
+            primary = primary_data.get(original_frame)
+            secondary = secondary_data.get(original_frame)
+            blur_values = [x['blur'] for x in (primary, secondary) if x is not None]
+            if not blur_values:
                 continue
 
-            blur_match = blur_pattern.search(line)
-            if blur_match:
-                blur_value = float(blur_match.group(1))
-                # Convert blur (0-100+) to sharpness (100-0), clamped
-                sharpness = max(0, min(100, 100 - blur_value * 10))
+            blur_value = max(blur_values)
+            sharpness = max(0, min(100, 100 - blur_value * 10))
+            frame_time = primary['time'] if primary is not None else secondary['time']
 
-                # Map the decoded frame index back to the original timeline so
-                # downstream extraction uses the real frame number.
-                original_frame = current_frame + frame_offset
+            self.frame_data.append({
+                'frame': original_frame,
+                'time': frame_time,
+                'blur': blur_value,
+                'sharpness': sharpness
+            })
 
-                self.frame_data.append({
-                    'frame': original_frame,
-                    'time': current_time,
-                    'blur': blur_value,
-                    'sharpness': sharpness
-                })
+            if len(self.frame_data) % 500 == 0:
+                print(f"  Analyzed {len(self.frame_data)} combined frames...")
 
-                # Progress indicator every 500 frames
-                if len(self.frame_data) % 500 == 0:
-                    print(f"  Analyzed {len(self.frame_data)} frames...")
-
-        process.wait()
-
-        print(f"  Analysis complete: {len(self.frame_data)} frames analyzed")
+        print(f"  Analysis complete: {len(self.frame_data)} combined frames analyzed")
 
         if self.frame_data:
             avg_sharpness = sum(f['sharpness'] for f in self.frame_data) / len(self.frame_data)
             min_sharpness = min(f['sharpness'] for f in self.frame_data)
             max_sharpness = max(f['sharpness'] for f in self.frame_data)
-            print(f"  Sharpness stats: avg={avg_sharpness:.1f}, min={min_sharpness:.1f}, max={max_sharpness:.1f}")
+            print(f"  Combined sharpness stats: avg={avg_sharpness:.1f}, min={min_sharpness:.1f}, max={max_sharpness:.1f}")
 
         return self.frame_data
 
